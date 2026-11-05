@@ -31,6 +31,15 @@ export interface ExtraBuyRow {
 
 export type BacktestHorizon = "1y" | "3y" | "since_first_buy" | "custom";
 
+/** Mode d’un indicateur signal : off / acheter si / ajuster budget. */
+export type IndicatorMode = "off" | "gate" | "scale";
+
+export function indicatorMode(gateEnabled: boolean, scaleEnabled: boolean): IndicatorMode {
+  if (scaleEnabled) return "scale";
+  if (gateEnabled) return "gate";
+  return "off";
+}
+
 /** Indice de référence du régime par défaut (hors allocation OK). */
 export const DEFAULT_REGIME_REFERENCE = "IWDA.AS";
 export const DEFAULT_REGIME_REFERENCE_LABEL = "MSCI World";
@@ -54,22 +63,67 @@ export interface EditorState {
   /** Période de la SMA pour détecter haussier / baissier. */
   regimeSmaPeriod: number;
   /**
-   * Actif de référence pour le régime.
-   * Défaut : {@link DEFAULT_REGIME_REFERENCE} (MSCI World) — pas besoin qu’il soit dans l’allocation.
+   * `per_asset` : chaque actif juge sa propre SMA (défaut).
+   * `reference` : un indice/actif unique pilote tout le portefeuille.
+   */
+  regimeScope: "per_asset" | "reference";
+  /**
+   * Actif de référence pour le régime (uniquement si regimeScope = reference).
+   * Défaut : {@link DEFAULT_REGIME_REFERENCE} (MSCI World).
    * "" = utiliser le plus gros poids de l’allocation (choix explicite).
    */
   regimeReferenceAsset: string;
+  /**
+   * Fin de fenêtre sans signal : verser le budget neutre (souvent ×1),
+   * pas le multiplicateur haussier/baissier.
+   */
+  fallbackNeutral: boolean;
+  /**
+   * Acheter uniquement si un déclencheur (gate) a matché — pas de rattrapage
+   * silencieux en fin de fenêtre.
+   */
+  requireSignal: boolean;
   dipEnabled: boolean;
   dipPct: number;
+  dipScaleEnabled: boolean;
+  dipDeepGte: number;
+  dipDeepFactor: number;
+  dipCalmLt: number;
+  dipCalmFactor: number;
   rsiEnabled: boolean;
   rsiValue: number;
+  rsiScaleEnabled: boolean;
+  rsiLowLte: number;
+  rsiLowFactor: number;
+  rsiHighGte: number;
+  rsiHighFactor: number;
   fearGreedEnabled: boolean;
   fearGreedValue: number;
+  /**
+   * Module le budget selon Fear & Greed (pas un veto d’achat) :
+   * ≤ low → ×lowFactor ; ≥ high → ×highFactor ; sinon ×1.
+   */
+  fearGreedScaleEnabled: boolean;
+  fearGreedLowLte: number;
+  fearGreedLowFactor: number;
+  fearGreedHighGte: number;
+  fearGreedHighFactor: number;
   macdEnabled: boolean;
+  macdScaleEnabled: boolean;
+  macdPosFactor: number;
+  macdNegFactor: number;
   bollingerEnabled: boolean;
   bollingerPctB: number;
+  bollingerScaleEnabled: boolean;
+  bollingerLowLte: number;
+  bollingerLowFactor: number;
+  bollingerHighGte: number;
+  bollingerHighFactor: number;
   smaBuyEnabled: boolean;
   smaBuyPeriod: number;
+  smaScaleEnabled: boolean;
+  smaBelowFactor: number;
+  smaAboveFactor: number;
   athEnabled: boolean;
   athLookback: number;
   reserveEnabled: boolean;
@@ -81,11 +135,11 @@ export interface EditorState {
   riseTiersEnabled: boolean;
   riseTiers: ScaleTierRow[];
   tierLookback: number;
-  /** Gate volatilité (veto ou scale). */
+  /** Volatilité : veto / scale / gate (n’acheter que si vol basse). */
   volEnabled: boolean;
   volPeriod: number;
   volMaxPct: number;
-  volMode: "veto" | "scale";
+  volMode: "veto" | "scale" | "gate";
   volScaleFactor: number;
   /** Achats exceptionnels répétés (hors DCA). */
   extraBuysEnabled: boolean;
@@ -95,6 +149,17 @@ export interface EditorState {
   feePct: number;
   /** Horizon backtest choisi dans le chat (null = pas encore fixé). */
   horizon: BacktestHorizon | null;
+  /**
+   * Réponse chat « mêmes actifs que le portefeuille ? ».
+   * portfolio → quiz à la simulation ; custom → allocation chat, pas de quiz.
+   */
+  assetsChoice?: "portfolio" | "custom";
+  /** Clarification montant unique multi-actifs : total vs par actif. */
+  budgetSplit?: "total" | "per_asset";
+  /** Montant cité avant ×n (si budgetSplit = per_asset). */
+  budgetQuotedAmount?: number;
+  allocationMode?: "replace" | "add";
+  assetClassPolicy?: "mixed_ok" | "crypto_only" | "equity_only";
 }
 
 export const DEFAULT_STATE: EditorState = {
@@ -114,18 +179,47 @@ export const DEFAULT_STATE: EditorState = {
   neutralMult: 1,
   regimeBandPct: 2,
   regimeSmaPeriod: 200,
+  regimeScope: "per_asset",
   regimeReferenceAsset: DEFAULT_REGIME_REFERENCE,
+  fallbackNeutral: true,
+  requireSignal: false,
   dipEnabled: true,
   dipPct: 3,
+  dipScaleEnabled: false,
+  dipDeepGte: 3,
+  dipDeepFactor: 2,
+  dipCalmLt: 1,
+  dipCalmFactor: 0.5,
   rsiEnabled: true,
   rsiValue: 40,
+  rsiScaleEnabled: false,
+  rsiLowLte: 30,
+  rsiLowFactor: 2,
+  rsiHighGte: 70,
+  rsiHighFactor: 0.5,
   fearGreedEnabled: false,
   fearGreedValue: 25,
+  fearGreedScaleEnabled: false,
+  fearGreedLowLte: 35,
+  fearGreedLowFactor: 2,
+  fearGreedHighGte: 80,
+  fearGreedHighFactor: 0.5,
   macdEnabled: false,
+  macdScaleEnabled: false,
+  macdPosFactor: 1.2,
+  macdNegFactor: 0.8,
   bollingerEnabled: false,
   bollingerPctB: 0.05,
+  bollingerScaleEnabled: false,
+  bollingerLowLte: 0.05,
+  bollingerLowFactor: 2,
+  bollingerHighGte: 0.95,
+  bollingerHighFactor: 0.5,
   smaBuyEnabled: false,
   smaBuyPeriod: 200,
+  smaScaleEnabled: false,
+  smaBelowFactor: 1.5,
+  smaAboveFactor: 0.7,
   athEnabled: true,
   athLookback: 90,
   reserveEnabled: true,
@@ -170,9 +264,16 @@ export function blankEditorState(
     ...DEFAULT_STATE,
     ...off,
     fearGreedEnabled: false,
+    fearGreedScaleEnabled: false,
+    dipScaleEnabled: false,
+    rsiScaleEnabled: false,
     macdEnabled: false,
+    macdScaleEnabled: false,
     bollingerEnabled: false,
+    bollingerScaleEnabled: false,
     smaBuyEnabled: false,
+    smaScaleEnabled: false,
+    requireSignal: false,
     budgetAmount: 200,
     windowFrom: 1,
     windowTo: 7,
@@ -376,16 +477,67 @@ export function allocationTotal(state: EditorState): number {
 export function toStrategyDocument(state: EditorState): Record<string, unknown> {
   const regimeReferenceAsset =
     typeof state.regimeReferenceAsset === "string" ? state.regimeReferenceAsset : "";
+  // Indépendance par défaut. Mode reference uniquement si choisi ET ticker fourni.
+  const regimeScope =
+    state.regimeScope === "reference" && regimeReferenceAsset.trim()
+      ? "reference"
+      : "per_asset";
   const timingRules: Record<string, unknown>[] = [];
-  if (state.dipEnabled) timingRules.push({ type: "dip_trigger", drop_pct: state.dipPct });
-  if (state.rsiEnabled) timingRules.push({ type: "rsi_below", value: state.rsiValue });
-  if (state.fearGreedEnabled) {
+  if (state.dipScaleEnabled) {
+    timingRules.push({
+      type: "dip_scale",
+      deep_gte_pct: state.dipDeepGte,
+      deep_factor: state.dipDeepFactor,
+      calm_lt_pct: state.dipCalmLt,
+      calm_factor: state.dipCalmFactor,
+    });
+  } else if (state.dipEnabled) {
+    timingRules.push({ type: "dip_trigger", drop_pct: state.dipPct });
+  }
+  if (state.rsiScaleEnabled) {
+    timingRules.push({
+      type: "rsi_scale",
+      low_lte: state.rsiLowLte,
+      low_factor: state.rsiLowFactor,
+      high_gte: state.rsiHighGte,
+      high_factor: state.rsiHighFactor,
+      period: 14,
+    });
+  } else if (state.rsiEnabled) {
+    timingRules.push({ type: "rsi_below", value: state.rsiValue });
+  }
+  if (state.fearGreedScaleEnabled) {
+    timingRules.push({
+      type: "fear_greed_scale",
+      low_lte: state.fearGreedLowLte,
+      low_factor: state.fearGreedLowFactor,
+      high_gte: state.fearGreedHighGte,
+      high_factor: state.fearGreedHighFactor,
+    });
+  } else if (state.fearGreedEnabled) {
     timingRules.push({ type: "fear_greed_below", value: state.fearGreedValue });
   }
-  if (state.macdEnabled) {
+  if (state.macdScaleEnabled) {
+    timingRules.push({
+      type: "macd_scale",
+      pos_gt: 0,
+      pos_factor: state.macdPosFactor,
+      neg_lt: 0,
+      neg_factor: state.macdNegFactor,
+    });
+  } else if (state.macdEnabled) {
     timingRules.push({ type: "macd_histogram", op: "gt", value: 0 });
   }
-  if (state.bollingerEnabled) {
+  if (state.bollingerScaleEnabled) {
+    timingRules.push({
+      type: "bollinger_scale",
+      low_lte: state.bollingerLowLte,
+      low_factor: state.bollingerLowFactor,
+      high_gte: state.bollingerHighGte,
+      high_factor: state.bollingerHighFactor,
+      period: 20,
+    });
+  } else if (state.bollingerEnabled) {
     timingRules.push({
       type: "bollinger_pctb",
       op: "lte",
@@ -393,7 +545,14 @@ export function toStrategyDocument(state: EditorState): Record<string, unknown> 
       period: 20,
     });
   }
-  if (state.smaBuyEnabled) {
+  if (state.smaScaleEnabled) {
+    timingRules.push({
+      type: "sma_scale",
+      period: state.smaBuyPeriod,
+      below_factor: state.smaBelowFactor,
+      above_factor: state.smaAboveFactor,
+    });
+  } else if (state.smaBuyEnabled) {
     timingRules.push({ type: "price_below_sma", period: state.smaBuyPeriod });
   }
   if (state.athEnabled) timingRules.push({ type: "avoid_ath", lookback_days: state.athLookback });
@@ -420,9 +579,14 @@ export function toStrategyDocument(state: EditorState): Record<string, unknown> 
     }
   }
 
-  const maxDay = state.period === "weekly" ? 7 : 28;
+  // Gate exclusif : flag explicite (chat « que si » / toggle réglages).
+  // Scale F&G (modulation) ≠ gate : on n’active jamais require_signal pour du scale.
+  const require_signal =
+    state.requireSignal === true && !state.fearGreedScaleEnabled;
+
+  const maxDay = state.period === "weekly" ? 7 : 31;
   const windowFrom = Math.min(Math.max(1, state.windowFrom), maxDay);
-  const windowTo = Math.min(Math.max(windowFrom, state.windowTo), state.period === "weekly" ? 7 : 31);
+  const windowTo = Math.min(Math.max(windowFrom, state.windowTo), maxDay);
 
   const budget_scale_tiers =
     state.ddTiersEnabled || state.riseTiersEnabled
@@ -454,8 +618,8 @@ export function toStrategyDocument(state: EditorState): Record<string, unknown> 
             indicator: "price_vs_sma" as const,
             sma_period: state.regimeSmaPeriod,
             band_pct: state.regimeBandPct,
-            // Défaut MSCI World ; "" = choix explicite « plus gros poids » (pas de champ).
-            ...(regimeReferenceAsset.trim()
+            scope: regimeScope,
+            ...(regimeScope === "reference" && regimeReferenceAsset.trim()
               ? {
                   reference_asset: canonicalMarketSymbol(regimeReferenceAsset.trim()),
                 }
@@ -463,11 +627,13 @@ export function toStrategyDocument(state: EditorState): Record<string, unknown> 
             bull: { budget_multiplier: state.bullMult },
             neutral: { budget_multiplier: state.neutralMult },
             bear: { budget_multiplier: state.bearMult },
+            fallback_budget: state.fallbackNeutral !== false ? "neutral" : "regime",
           },
         }
       : {}),
     ...(budget_scale_tiers ? { budget_scale_tiers } : {}),
     timing_rules: timingRules,
+    ...(require_signal ? { require_signal: true } : {}),
     ...(state.reserveEnabled ? { cash_rules: { min_cash_reserve_pct: state.reservePct } } : {}),
   };
 }

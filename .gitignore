@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.next/
+*.tsbuildinfo
+.DS_Store
+.env
+.env.*
+tmp-*.json
+
+# Cache local de marché et portefeuilles (regénérable via `pnpm ordium fetch`)
+/data/

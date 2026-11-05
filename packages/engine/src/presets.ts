@@ -3,6 +3,8 @@
  * Source de vérité pour le prompt NL et les chips UI.
  */
 
+import { extractFearGreedScaleHint } from "./scheduleHints.js";
+
 export type StrategyStatus = "ready" | "approx" | "later";
 
 /** Champs du formulaire Smart DCA (miroir EditorState, sans allocation). */
@@ -12,6 +14,25 @@ export interface StrategyFormPatch {
   period?: "weekly" | "monthly";
   windowFrom?: number;
   windowTo?: number;
+  /** Répartition extraite du chat (ex. 50 BTC / 50 ETH). */
+  allocation?: { asset: string; pct: number }[];
+  /** Réponse chat : mêmes actifs que le portefeuille, ou custom. */
+  assetsChoice?: "portfolio" | "custom";
+  /**
+   * Montant unique multi-actifs clarifié :
+   * total = budgetAmount réparti ; per_asset = budgetAmount déjà = quoted × n.
+   */
+  budgetSplit?: "total" | "per_asset";
+  /** Montant cité avant clarification / multiplication. */
+  budgetQuotedAmount?: number;
+  /** replace = liste complète ; add = union (« ajoute Amazon »). */
+  allocationMode?: "replace" | "add";
+  /** Mix crypto/actions face aux signaux (F&G global). */
+  assetClassPolicy?: "mixed_ok" | "crypto_only" | "equity_only";
+  /** Début de backtest (date ISO) — issu du chat. */
+  from?: string;
+  to?: string;
+  horizon?: "1y" | "3y" | "since_first_buy" | "custom" | null;
   tranches?: number;
   distribution?: "equal" | "random";
   regimeEnabled?: boolean;
@@ -20,11 +41,49 @@ export interface StrategyFormPatch {
   neutralMult?: number;
   regimeBandPct?: number;
   regimeSmaPeriod?: number;
+  regimeScope?: "per_asset" | "reference";
   regimeReferenceAsset?: string;
+  /** Fin de fenêtre → budget neutre (×1) plutôt que le régime. */
+  fallbackNeutral?: boolean;
+  /** Pas de rattrapage si aucun signal (gate exclusif). */
+  requireSignal?: boolean;
   dipEnabled?: boolean;
   dipPct?: number;
+  dipScaleEnabled?: boolean;
+  dipDeepGte?: number;
+  dipDeepFactor?: number;
+  dipCalmLt?: number;
+  dipCalmFactor?: number;
   rsiEnabled?: boolean;
   rsiValue?: number;
+  rsiScaleEnabled?: boolean;
+  rsiLowLte?: number;
+  rsiLowFactor?: number;
+  rsiHighGte?: number;
+  rsiHighFactor?: number;
+  fearGreedEnabled?: boolean;
+  fearGreedValue?: number;
+  fearGreedScaleEnabled?: boolean;
+  fearGreedLowLte?: number;
+  fearGreedLowFactor?: number;
+  fearGreedHighGte?: number;
+  fearGreedHighFactor?: number;
+  macdEnabled?: boolean;
+  macdScaleEnabled?: boolean;
+  macdPosFactor?: number;
+  macdNegFactor?: number;
+  bollingerEnabled?: boolean;
+  bollingerPctB?: number;
+  bollingerScaleEnabled?: boolean;
+  bollingerLowLte?: number;
+  bollingerLowFactor?: number;
+  bollingerHighGte?: number;
+  bollingerHighFactor?: number;
+  smaBuyEnabled?: boolean;
+  smaBuyPeriod?: number;
+  smaScaleEnabled?: boolean;
+  smaBelowFactor?: number;
+  smaAboveFactor?: number;
   athEnabled?: boolean;
   athLookback?: number;
   reserveEnabled?: boolean;
@@ -38,11 +97,11 @@ export interface StrategyFormPatch {
   volEnabled?: boolean;
   volPeriod?: number;
   volMaxPct?: number;
-  volMode?: "veto" | "scale";
+  volMode?: "veto" | "scale" | "gate";
   volScaleFactor?: number;
   extraBuysEnabled?: boolean;
   extraBuys?: {
-    trigger: "rsi_below" | "dip";
+    trigger: "rsi_below" | "dip" | "fear_greed" | "macd" | "bollinger";
     value: number;
     pctOfBudget: number;
     cooldownDays: number;
@@ -69,8 +128,19 @@ export interface StrategyPreset {
 export function classicOff(): StrategyFormPatch {
   return {
     regimeEnabled: false,
+    requireSignal: false,
     dipEnabled: false,
+    dipScaleEnabled: false,
     rsiEnabled: false,
+    rsiScaleEnabled: false,
+    fearGreedEnabled: false,
+    fearGreedScaleEnabled: false,
+    macdEnabled: false,
+    macdScaleEnabled: false,
+    bollingerEnabled: false,
+    bollingerScaleEnabled: false,
+    smaBuyEnabled: false,
+    smaScaleEnabled: false,
     athEnabled: false,
     reserveEnabled: false,
     ddTiersEnabled: false,
@@ -102,6 +172,7 @@ export const STRATEGY_PRESETS: StrategyPreset[] = [
     keywords: ["smart", "intelligent", "timing", "optimisé", "fenêtre"],
     patch: {
       regimeEnabled: true,
+      regimeScope: "per_asset",
       bullMult: 0.7,
       bearMult: 1.5,
       dipEnabled: true,
@@ -121,10 +192,11 @@ export const STRATEGY_PRESETS: StrategyPreset[] = [
     name: "DCA pondéré par la tendance",
     family: "DCA & accumulation",
     status: "ready",
-    summary: "Moins en marché haussier (SMA200), plus en baissier.",
+    summary: "Moins quand l’actif est haussier (SMA), plus quand il est baissier — par actif.",
     keywords: ["tendance", "régime", "sma", "haussier", "baissier", "bull", "bear"],
     patch: {
       regimeEnabled: true,
+      regimeScope: "per_asset",
       bullMult: 0.7,
       bearMult: 1.5,
     },
@@ -301,11 +373,14 @@ export const STRATEGY_PRESETS: StrategyPreset[] = [
     id: "dca-fear-greed",
     name: "DCA selon Fear & Greed",
     family: "DCA & accumulation",
-    status: "later",
-    summary: "Multiplier le budget selon l’indice de sentiment.",
-    keywords: ["fear", "greed", "sentiment", "peur", "avidité"],
-    laterReason: "Donnée externe (v2). En attendant, le régime baissier est le plus proche.",
-    suggestIds: ["dca-tendance", "timing-retracement"],
+    status: "ready",
+    summary: "Acheter seulement quand l’indice Fear & Greed est sous un seuil.",
+    keywords: ["fear", "greed", "sentiment", "peur", "avidité", "fear and greed"],
+    patch: {
+      ...classicOff(),
+      fearGreedEnabled: true,
+      fearGreedValue: 35,
+    },
   },
   {
     id: "dca-saisonnier",
@@ -778,6 +853,29 @@ const NUM_LIMITS: Record<string, { min: number; max: number }> = {
   regimeSmaPeriod: { min: 5, max: 500 },
   dipPct: { min: 0.5, max: 50 },
   rsiValue: { min: 1, max: 99 },
+  fearGreedValue: { min: 1, max: 99 },
+  fearGreedLowLte: { min: 1, max: 99 },
+  fearGreedLowFactor: { min: 0, max: 5 },
+  fearGreedHighGte: { min: 1, max: 99 },
+  fearGreedHighFactor: { min: 0, max: 5 },
+  dipDeepGte: { min: 0.5, max: 50 },
+  dipDeepFactor: { min: 0, max: 5 },
+  dipCalmLt: { min: 0, max: 50 },
+  dipCalmFactor: { min: 0, max: 5 },
+  rsiLowLte: { min: 1, max: 99 },
+  rsiLowFactor: { min: 0, max: 5 },
+  rsiHighGte: { min: 1, max: 99 },
+  rsiHighFactor: { min: 0, max: 5 },
+  macdPosFactor: { min: 0, max: 5 },
+  macdNegFactor: { min: 0, max: 5 },
+  bollingerPctB: { min: 0, max: 1 },
+  bollingerLowLte: { min: 0, max: 1 },
+  bollingerLowFactor: { min: 0, max: 5 },
+  bollingerHighGte: { min: 0, max: 1 },
+  bollingerHighFactor: { min: 0, max: 5 },
+  smaBuyPeriod: { min: 5, max: 500 },
+  smaBelowFactor: { min: 0, max: 5 },
+  smaAboveFactor: { min: 0, max: 5 },
   athLookback: { min: 5, max: 400 },
   reservePct: { min: 0, max: 90 },
   feePct: { min: 0, max: 2 },
@@ -812,7 +910,18 @@ function sanitizeExtraBuys(
   for (const row of raw) {
     if (!row || typeof row !== "object") continue;
     const r = row as Record<string, unknown>;
-    const trigger = r.trigger === "dip" ? "dip" : r.trigger === "rsi_below" ? "rsi_below" : null;
+    const trigger =
+      r.trigger === "dip"
+        ? "dip"
+        : r.trigger === "rsi_below"
+          ? "rsi_below"
+          : r.trigger === "fear_greed"
+            ? "fear_greed"
+            : r.trigger === "macd"
+              ? "macd"
+              : r.trigger === "bollinger"
+                ? "bollinger"
+                : null;
     if (!trigger) continue;
     const value = Number(r.value);
     const pctOfBudget = Number(r.pctOfBudget ?? r.pct_of_budget);
@@ -833,8 +942,20 @@ export function sanitizeFormPatch(raw: Record<string, unknown>): StrategyFormPat
   const out: StrategyFormPatch = {};
   const boolKeys = [
     "regimeEnabled",
+    "fallbackNeutral",
+    "requireSignal",
     "dipEnabled",
+    "dipScaleEnabled",
     "rsiEnabled",
+    "rsiScaleEnabled",
+    "fearGreedEnabled",
+    "fearGreedScaleEnabled",
+    "macdEnabled",
+    "macdScaleEnabled",
+    "bollingerEnabled",
+    "bollingerScaleEnabled",
+    "smaBuyEnabled",
+    "smaScaleEnabled",
     "athEnabled",
     "reserveEnabled",
     "ddTiersEnabled",
@@ -849,12 +970,17 @@ export function sanitizeFormPatch(raw: Record<string, unknown>): StrategyFormPat
   if (raw.distribution === "equal" || raw.distribution === "random") {
     out.distribution = raw.distribution;
   }
-  if (raw.volMode === "veto" || raw.volMode === "scale") out.volMode = raw.volMode;
+  if (raw.volMode === "veto" || raw.volMode === "scale" || raw.volMode === "gate") {
+    out.volMode = raw.volMode;
+  }
   if (typeof raw.currency === "string" && raw.currency.trim()) {
     out.currency = raw.currency.trim().toUpperCase().slice(0, 3);
   }
   if (typeof raw.regimeReferenceAsset === "string") {
     out.regimeReferenceAsset = raw.regimeReferenceAsset.trim().toUpperCase();
+  }
+  if (raw.regimeScope === "per_asset" || raw.regimeScope === "reference") {
+    out.regimeScope = raw.regimeScope;
   }
   for (const [key, lim] of Object.entries(NUM_LIMITS)) {
     const v = raw[key];
@@ -875,6 +1001,53 @@ export function sanitizeFormPatch(raw: Record<string, unknown>): StrategyFormPat
   if (rise) out.riseTiers = rise;
   const extras = sanitizeExtraBuys(raw.extraBuys);
   if (extras) out.extraBuys = extras;
+  if (raw.assetsChoice === "portfolio" || raw.assetsChoice === "custom") {
+    out.assetsChoice = raw.assetsChoice;
+  }
+  if (raw.budgetSplit === "total" || raw.budgetSplit === "per_asset") {
+    out.budgetSplit = raw.budgetSplit;
+  }
+  if (typeof raw.budgetQuotedAmount === "number" && Number.isFinite(raw.budgetQuotedAmount)) {
+    out.budgetQuotedAmount = Math.min(1_000_000, Math.max(1, raw.budgetQuotedAmount));
+  }
+  if (raw.allocationMode === "replace" || raw.allocationMode === "add") {
+    out.allocationMode = raw.allocationMode;
+  }
+  if (
+    raw.assetClassPolicy === "mixed_ok" ||
+    raw.assetClassPolicy === "crypto_only" ||
+    raw.assetClassPolicy === "equity_only"
+  ) {
+    out.assetClassPolicy = raw.assetClassPolicy;
+  }
+  if (typeof raw.from === "string" && /^\d{4}-\d{2}-\d{2}$/.test(raw.from)) {
+    out.from = raw.from;
+  }
+  if (typeof raw.to === "string" && /^\d{4}-\d{2}-\d{2}$/.test(raw.to)) {
+    out.to = raw.to;
+  }
+  if (
+    raw.horizon === "1y" ||
+    raw.horizon === "3y" ||
+    raw.horizon === "since_first_buy" ||
+    raw.horizon === "custom" ||
+    raw.horizon === null
+  ) {
+    out.horizon = raw.horizon;
+  }
+  if (Array.isArray(raw.allocation)) {
+    const alloc = raw.allocation
+      .map((row) => {
+        if (!row || typeof row !== "object") return null;
+        const r = row as Record<string, unknown>;
+        const asset = typeof r.asset === "string" ? r.asset.trim().toUpperCase() : "";
+        const pct = typeof r.pct === "number" ? r.pct : typeof r.weight === "number" ? r.weight : NaN;
+        if (!asset || !Number.isFinite(pct) || pct <= 0) return null;
+        return { asset, pct };
+      })
+      .filter((x): x is { asset: string; pct: number } => x != null);
+    if (alloc.length) out.allocation = alloc;
+  }
   return out;
 }
 
@@ -952,10 +1125,24 @@ export function lexicalMatchPresetIds(prompt: string): string[] {
     if (score > 0) scored.push({ id: p.id, score });
   }
   scored.sort((a, b) => b.score - a.score);
-  const ids = scored.slice(0, 5).map((s) => s.id);
-  // Si rien : smart-dca par défaut si le texte évoque une stratégie « complète »
+  let ids = scored.slice(0, 5).map((s) => s.id);
+
+  // Fear & Greed explicite → preset dédié, pas Smart DCA.
+  // Modulation (×2 / ×0.5) → DCA classique + scale (pas gate d’achat).
+  if (/\bfear\b/.test(text) && /\bgreed\b/.test(text)) {
+    if (extractFearGreedScaleHint(prompt)) {
+      ids = [
+        "dca-classique",
+        ...ids.filter((id) => id !== "dca-fear-greed" && id !== "smart-dca" && id !== "dca-classique"),
+      ];
+    } else {
+      ids = ["dca-fear-greed", ...ids.filter((id) => id !== "dca-fear-greed" && id !== "smart-dca")];
+    }
+  }
+
+  // Si rien : DCA classique (pas Smart DCA qui injecte dip/RSI/ATH).
   if (ids.length === 0 && /(strateg|investir|acheter|dca)/i.test(prompt)) {
-    return ["smart-dca"];
+    return ["dca-classique"];
   }
   return ids;
 }
@@ -963,19 +1150,74 @@ export function lexicalMatchPresetIds(prompt: string): string[] {
 export function explainPatch(patch: StrategyFormPatch): string[] {
   const lines: string[] = [];
   if (patch.regimeEnabled === true) {
+    const scopeLabel =
+      patch.regimeScope === "reference" ? "indice unique" : "chaque actif indépendant";
     lines.push(
-      `Gestion du marché activée (SMA ${patch.regimeSmaPeriod ?? "…"} j, bande ±${patch.regimeBandPct ?? "…"} %, haussier ×${patch.bullMult ?? "…"}, neutre ×${patch.neutralMult ?? "…"}, baissier ×${patch.bearMult ?? "…"}).`,
+      `Gestion du marché activée (${scopeLabel}, SMA ${patch.regimeSmaPeriod ?? "…"} j, bande ±${patch.regimeBandPct ?? "…"} %, haussier ×${patch.bullMult ?? "…"}, neutre ×${patch.neutralMult ?? "…"}, baissier ×${patch.bearMult ?? "…"}).`,
     );
   }
+  if (patch.fallbackNeutral === true) {
+    lines.push("Fin de fenêtre sans signal : verser le budget neutre (×1), pas le régime.");
+  }
+  if (patch.fallbackNeutral === false) {
+    lines.push("Fin de fenêtre : garder le multiplicateur de régime.");
+  }
+  if (patch.requireSignal === true) {
+    lines.push("Acheter uniquement si signal (pas de rattrapage fin de fenêtre).");
+  }
+  if (patch.requireSignal === false) {
+    lines.push("Rattrapage fin de fenêtre autorisé.");
+  }
   if (patch.regimeEnabled === false) lines.push("Gestion du marché désactivée.");
-  if (patch.dipEnabled === true) {
+  if (patch.dipScaleEnabled === true) {
+    lines.push(
+      `Dip module le budget : baisse ≥${patch.dipDeepGte ?? 3}% → ×${patch.dipDeepFactor ?? 2}, <${patch.dipCalmLt ?? 1}% → ×${patch.dipCalmFactor ?? 0.5}.`,
+    );
+  } else if (patch.dipEnabled === true) {
     lines.push(`Acheter les baisses activé (seuil ${patch.dipPct ?? "…"} %).`);
   }
-  if (patch.dipEnabled === false) lines.push("Acheter les baisses désactivé.");
-  if (patch.rsiEnabled === true) {
+  if (patch.dipEnabled === false && patch.dipScaleEnabled === false) {
+    lines.push("Acheter les baisses désactivé.");
+  }
+  if (patch.rsiScaleEnabled === true) {
+    lines.push(
+      `RSI module le budget : ≤${patch.rsiLowLte ?? 30} → ×${patch.rsiLowFactor ?? 2}, ≥${patch.rsiHighGte ?? 70} → ×${patch.rsiHighFactor ?? 0.5}.`,
+    );
+  } else if (patch.rsiEnabled === true) {
     lines.push(`RSI activé (seuil ${patch.rsiValue ?? "…"}).`);
   }
-  if (patch.rsiEnabled === false) lines.push("RSI désactivé.");
+  if (patch.rsiEnabled === false && patch.rsiScaleEnabled === false) lines.push("RSI désactivé.");
+  if (patch.fearGreedEnabled === true) {
+    lines.push(`Fear & Greed activé (seuil ≤ ${patch.fearGreedValue ?? "…"}).`);
+  }
+  if (patch.fearGreedEnabled === false) lines.push("Fear & Greed désactivé.");
+  if (patch.fearGreedScaleEnabled === true) {
+    lines.push(
+      `Fear & Greed module le budget : ≤${patch.fearGreedLowLte ?? 35} → ×${patch.fearGreedLowFactor ?? 2}, ≥${patch.fearGreedHighGte ?? 80} → ×${patch.fearGreedHighFactor ?? 0.5}, sinon ×1.`,
+    );
+  }
+  if (patch.fearGreedScaleEnabled === false) lines.push("Modulation Fear & Greed désactivée.");
+  if (patch.macdScaleEnabled === true) {
+    lines.push(
+      `MACD module le budget : hist>0 → ×${patch.macdPosFactor ?? 1.2}, hist<0 → ×${patch.macdNegFactor ?? 0.8}.`,
+    );
+  } else if (patch.macdEnabled === true) {
+    lines.push("MACD positif : achat si histogramme > 0.");
+  }
+  if (patch.bollingerScaleEnabled === true) {
+    lines.push(
+      `Bollinger module le budget : %B≤${patch.bollingerLowLte ?? 0.05} → ×${patch.bollingerLowFactor ?? 2}, ≥${patch.bollingerHighGte ?? 0.95} → ×${patch.bollingerHighFactor ?? 0.5}.`,
+    );
+  } else if (patch.bollingerEnabled === true) {
+    lines.push(`Bollinger bande basse (%B ≤ ${patch.bollingerPctB ?? "…"}).`);
+  }
+  if (patch.smaScaleEnabled === true) {
+    lines.push(
+      `SMA module le budget : sous SMA → ×${patch.smaBelowFactor ?? 1.5}, au-dessus → ×${patch.smaAboveFactor ?? 0.7}.`,
+    );
+  } else if (patch.smaBuyEnabled === true) {
+    lines.push(`Acheter si prix sous SMA(${patch.smaBuyPeriod ?? "…"}).`);
+  }
   if (patch.athEnabled === true) {
     lines.push(`Éviter les sommets activé (lookback ${patch.athLookback ?? "…"} j).`);
   }

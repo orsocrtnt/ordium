@@ -1,0 +1,36 @@
+{
+  "name": "@ordium/web",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev --port 3000",
+    "build": "next build",
+    "start": "next start --port 3000",
+    "typecheck": "tsc --noEmit",
+    "test": "echo \"(pas de tests web en v0)\"",
+    "generate:template": "node scripts/generate-portfolio-template.mjs"
+  },
+  "dependencies": {
+    "@ordium/data": "workspace:*",
+    "@ordium/engine": "workspace:*",
+    "@ordium/execution": "workspace:*",
+    "@ordium/portfolio": "workspace:*",
+    "@supabase/ssr": "^0.12.3",
+    "@supabase/supabase-js": "^2.110.8",
+    "lightweight-charts": "^5.2.0",
+    "next": "^15.3.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "recharts": "^2.15.0"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4.0.0",
+    "@types/node": "^20.14.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "exceljs": "^4.4.0",
+    "postcss": "^8.4.0",
+    "tailwindcss": "^4.0.0",
+    "typescript": "^5.6.0"
+  }
+}

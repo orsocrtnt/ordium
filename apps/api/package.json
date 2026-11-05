@@ -1,0 +1,28 @@
+{
+  "name": "@ordium/api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch --include '../../packages/engine/src/**' --include '../../packages/data/src/**' --include '../../packages/portfolio/src/**' src/index.ts",
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "echo \"(pas de tests API en v0)\""
+  },
+  "dependencies": {
+    "@fastify/cors": "^11.0.0",
+    "@fastify/multipart": "^9.0.0",
+    "@google/generative-ai": "^0.24.0",
+    "@ordium/data": "workspace:*",
+    "@ordium/engine": "workspace:*",
+    "@ordium/execution": "workspace:*",
+    "@ordium/portfolio": "workspace:*",
+    "dotenv": "^16.5.0",
+    "fastify": "^5.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

@@ -1,9 +1,10 @@
 import type { FastifyInstance } from "fastify";
-import { parseStrategy, runBacktest, toClassicDca, type BacktestResult } from "@ordium/engine";
+import { parseStrategy, runBacktest, toClassicDca, isPerAssetRegime, type BacktestResult } from "@ordium/engine";
 import { fetchFearGreedHistory } from "@ordium/data";
 import { buildRealSeries, type RealPortfolioSeries } from "@ordium/portfolio";
 import { loadSeriesForAssets } from "../lib/data.js";
 import { loadPortfolio, seriesForPortfolio } from "../lib/portfolio.js";
+import { userKeyFromRequest } from "../lib/userKey.js";
 
 function strategyNeedsFearGreed(strategy: {
   timing_rules?: Array<{ type: string; trigger?: string }>;
@@ -11,6 +12,7 @@ function strategyNeedsFearGreed(strategy: {
   return (strategy.timing_rules ?? []).some(
     (r) =>
       r.type === "fear_greed_below" ||
+      r.type === "fear_greed_scale" ||
       (r.type === "extra_buy" && r.trigger === "fear_greed"),
   );
 }
@@ -73,10 +75,14 @@ export async function backtestRoutes(app: FastifyInstance) {
       const needFg = strategyNeedsFearGreed(strategy);
       const wantReal = Boolean(body.includePortfolio);
       const allocationSymbols = strategy.allocation.map((a) => a.asset);
-      const referenceSymbol = strategy.regime_adjustment?.reference_asset?.trim() || null;
+      const referenceSymbol =
+        strategy.regime_adjustment && !isPerAssetRegime(strategy)
+          ? strategy.regime_adjustment.reference_asset?.trim() || null
+          : null;
 
       // Charge toujours d'abord les actifs réellement achetés.
       // Si l'indice de référence externe échoue, on replie sans casser le backtest.
+      const userKey = userKeyFromRequest(req);
       const [baseSeries, fearGreedByDate, portfolio] = await Promise.all([
         loadSeriesForAssets(allocationSymbols, strategy.budget.currency, body.from, body.to, {
           warmupDays,
@@ -87,7 +93,7 @@ export async function backtestRoutes(app: FastifyInstance) {
               return undefined;
             })
           : Promise.resolve(undefined),
-        wantReal ? loadPortfolio() : Promise.resolve(null),
+        wantReal ? loadPortfolio(userKey) : Promise.resolve(null),
       ]);
       let series = baseSeries;
       if (referenceSymbol && !allocationSymbols.includes(referenceSymbol)) {

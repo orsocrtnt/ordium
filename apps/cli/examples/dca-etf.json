@@ -1,0 +1,8 @@
+{
+  "name": "DCA ETF S&P 500",
+  "budget": { "amount": 500, "currency": "USD", "period": "monthly" },
+  "window": { "type": "day_of_month", "from": 1, "to": 10 },
+  "allocation": [{ "asset": "SPY", "weight": 1 }],
+  "splitting": { "tranches": 2, "distribution": "equal" },
+  "timing_rules": [{ "type": "dip_trigger", "drop_pct": 2 }]
+}

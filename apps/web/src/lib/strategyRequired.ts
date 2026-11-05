@@ -1,11 +1,22 @@
 /**
- * Infos obligatoires chat — s’appuie sur extractScheduleHints (@ordium/engine)
- * pour le français naturel / SMS (« tt les mois », « je mets 200 », …).
+ * Infos obligatoires chat — thin wrapper autour de @ordium/engine requiredSchedule
+ * (même logique API + web).
  */
 
 import {
-  extractScheduleHints,
-  extractStartDateHint,
+  diagnoseStartDateHint,
+  extractRequiredFromText,
+  hasAssetsAnswer as engineHasAssetsAnswer,
+  hasExplicitStartDate as engineHasExplicitStartDate,
+  isLikelyCalendarYear,
+  messageForStartDateFailure,
+  missingRequired,
+  nextRequiredQuestion,
+  parseAssetsChoice,
+  questionForRequired,
+  stripReplyQuestionsForAnswered,
+  type RequiredFieldId,
+  type RequiredScheduleDraft,
 } from "@ordium/engine";
 import {
   applyStartDate,
@@ -13,14 +24,29 @@ import {
   type EditorState,
 } from "./strategy";
 
-export type RequiredFieldId = "budget" | "frequency" | "window" | "startDate";
+export type { RequiredFieldId };
+export { messageForStartDateFailure, stripReplyQuestionsForAnswered };
 
-/** Budget qui ressemble à une année (ex. 2024) — confusion date / montant. */
-export function isSuspiciousYearBudget(n: number | null | undefined): boolean {
-  return n != null && Number.isInteger(n) && n >= 2010 && n <= 2039;
+/** Feedback si l’utilisateur répond une mauvaise date alors qu’on attend startDate. */
+export function startDateFailureMessage(text: string): string | null {
+  const d = diagnoseStartDateHint(text, { bareYear: true });
+  if (d.ok) return null;
+  if (d.reason === "unparsed") {
+    const looksLikeDate =
+      /\d{1,4}[./\-]\d{1,2}([./\-]\d{2,4})?/.test(text) ||
+      /\b(20\d{2})\b/.test(text) ||
+      /\b(janvier|fevrier|mars|avril|mai|juin|juillet|aout|septembre|octobre|novembre|decembre)\b/i.test(
+        text,
+      );
+    if (!looksLikeDate) return null;
+  }
+  return messageForStartDateFailure(d.reason);
 }
 
-/** Retire un budget « année » d’un patch / brouillon. */
+export function isSuspiciousYearBudget(n: number | null | undefined): boolean {
+  return n != null && isLikelyCalendarYear(n);
+}
+
 export function scrubYearBudget<T extends { budgetAmount?: number }>(patch: T): T {
   if (!isSuspiciousYearBudget(patch.budgetAmount)) return patch;
   const next = { ...patch };
@@ -33,44 +59,23 @@ export type RequiredField = {
   question: (currency: string) => string;
 };
 
-function currencyLabel(currency: string): { example: string; unit: string } {
-  const code = (currency || "EUR").toUpperCase();
-  if (code === "USD") return { example: "500 $", unit: "dollars" };
-  return { example: "500 €", unit: "euros" };
-}
-
-export const REQUIRED_FIELDS: RequiredField[] = [
-  {
-    id: "budget",
-    question: (currency) => {
-      const { example, unit } = currencyLabel(currency);
-      return `Il me manque le montant de base par période. Réponds dans le chat — « 200 » suffit (ce sera des ${unit}), ou « ${example} », « je mets 300 »…`;
-    },
-  },
-  {
-    id: "frequency",
-    question: () =>
-      "Il me manque la fréquence. Réponds dans le chat comme tu veux : « tt les mois », « chaque semaine », « mensuel »…",
-  },
-  {
-    id: "window",
-    question: () =>
-      "Il me manque la fenêtre d’achat. Ex. « du 1 au 7 », « 1-7 », « les premiers jours »…",
-  },
-  {
-    id: "startDate",
-    question: () =>
-      "Il me manque la date de début du backtest — obligatoire. Réponds une date précise : « 15/03/2023 », « 2023-03-15 », « mars 2024 »…",
-  },
-];
-
-const FIELD_BY_ID = Object.fromEntries(REQUIRED_FIELDS.map((f) => [f.id, f])) as Record<
-  RequiredFieldId,
-  RequiredField
->;
+export const REQUIRED_FIELDS: RequiredField[] = (
+  [
+    "budget",
+    "frequency",
+    "window",
+    "assets",
+    "budgetSplit",
+    "assetClassMix",
+    "startDate",
+  ] as RequiredFieldId[]
+).map((id) => ({
+  id,
+  question: (currency: string) => questionForRequired(id, currency),
+}));
 
 export function questionFor(id: RequiredFieldId, currency = "EUR"): string {
-  return FIELD_BY_ID[id].question(currency);
+  return questionForRequired(id, currency);
 }
 
 export type ParseOpts = {
@@ -79,46 +84,23 @@ export type ParseOpts = {
   firstTransactionDate?: string | null;
 };
 
-/** Date de début saisie / confirmée (pas un simple preset « 1 an »). */
 export function hasExplicitStartDate(draft: Partial<EditorState>): boolean {
-  if (!draft.from || !/^\d{4}-\d{2}-\d{2}$/.test(draft.from)) return false;
-  // custom = date tapée ; since_first_buy = date concrète du portefeuille
-  return draft.horizon === "custom" || draft.horizon === "since_first_buy";
+  return engineHasExplicitStartDate(draft as RequiredScheduleDraft);
 }
 
-function hintsToPatch(
-  hints: ReturnType<typeof extractScheduleHints>,
-  opts: ParseOpts = {},
-): Partial<EditorState> {
-  const out: Partial<EditorState> = {};
-  if (hints.budgetAmount != null) out.budgetAmount = hints.budgetAmount;
-  if (hints.currency) out.currency = hints.currency;
-  if (hints.period) out.period = hints.period;
-  if (hints.windowFrom != null) out.windowFrom = hints.windowFrom;
-  if (hints.windowTo != null) out.windowTo = hints.windowTo;
-  // Date de début : uniquement une date explicite (pas 1y/3y).
-  if (hints.from) {
-    Object.assign(out, applyStartDate(hints.from));
-  }
-  // Régime explicite dans le message (« +15% baisse / -15% hausse »)
-  if (hints.regimeEnabled) {
-    out.regimeEnabled = true;
-    if (hints.bearMult != null) out.bearMult = hints.bearMult;
-    if (hints.bullMult != null) out.bullMult = hints.bullMult;
-    if (hints.regimeReferenceAsset !== undefined) {
-      out.regimeReferenceAsset = hints.regimeReferenceAsset;
-    }
-  }
-  return out;
+export function hasAssetsAnswer(draft: Partial<EditorState>): boolean {
+  return engineHasAssetsAnswer(draft as RequiredScheduleDraft);
 }
 
 export function detectsField(id: RequiredFieldId, text: string): boolean {
-  const h = extractScheduleHints(text, { looseBudget: id === "budget" });
-  if (id === "budget") return h.budgetAmount != null;
-  if (id === "frequency") return h.period != null;
-  if (id === "window") return h.windowFrom != null && h.windowTo != null;
-  if (id === "startDate") return extractStartDateHint(text) != null || h.from != null;
-  return false;
+  const extracted = extractRequiredFromText(text, { awaiting: id });
+  if (id === "budget") return extracted.budgetAmount != null;
+  if (id === "frequency") return extracted.period != null;
+  if (id === "window") return extracted.windowFrom != null && extracted.windowTo != null;
+  if (id === "assets") return hasAssetsAnswer(extracted);
+  if (id === "budgetSplit") return extracted.budgetSplit != null;
+  if (id === "assetClassMix") return extracted.assetClassPolicy != null;
+  return hasExplicitStartDate(extracted);
 }
 
 export function missingRequiredFields(userTexts: string[]): RequiredFieldId[] {
@@ -127,14 +109,16 @@ export function missingRequiredFields(userTexts: string[]): RequiredFieldId[] {
   });
 }
 
-/** Champs manquants d’après le brouillon (plus fiable que le seul texte utilisateur). */
+export function parseAssetsAnswer(
+  text: string,
+  opts: ParseOpts = {},
+): Partial<EditorState> | null {
+  return parseAssetsChoice(text, opts.awaiting) as Partial<EditorState> | null;
+}
+
+/** Champs manquants d’après le brouillon — même prédicat que l’API. */
 export function missingFromDraft(draft: Partial<EditorState>): RequiredFieldId[] {
-  const missing: RequiredFieldId[] = [];
-  if (draft.budgetAmount == null || !(draft.budgetAmount > 0)) missing.push("budget");
-  if (draft.period !== "weekly" && draft.period !== "monthly") missing.push("frequency");
-  if (draft.windowFrom == null || draft.windowTo == null) missing.push("window");
-  if (!hasExplicitStartDate(draft)) missing.push("startDate");
-  return missing;
+  return missingRequired(draft as RequiredScheduleDraft);
 }
 
 export function parseRequiredAnswer(
@@ -142,33 +126,39 @@ export function parseRequiredAnswer(
   text: string,
   opts: ParseOpts = {},
 ): Partial<EditorState> | null {
-  const h = extractScheduleHints(text, {
+  const extracted = extractRequiredFromText(text, {
+    awaiting: field,
     defaultCurrency: opts.defaultCurrency,
-    looseBudget: opts.awaiting === "budget" || field === "budget",
+    firstTransactionDate: opts.firstTransactionDate,
   });
   if (field === "budget") {
-    return h.budgetAmount != null
-      ? { budgetAmount: h.budgetAmount, currency: h.currency ?? opts.defaultCurrency ?? "EUR" }
+    return extracted.budgetAmount != null
+      ? {
+          budgetAmount: extracted.budgetAmount,
+          currency: extracted.currency ?? opts.defaultCurrency ?? "EUR",
+        }
       : null;
   }
-  if (field === "frequency") return h.period ? { period: h.period } : null;
+  if (field === "frequency") return extracted.period ? { period: extracted.period } : null;
   if (field === "window") {
-    return h.windowFrom != null && h.windowTo != null
-      ? { windowFrom: h.windowFrom, windowTo: h.windowTo }
+    return extracted.windowFrom != null && extracted.windowTo != null
+      ? { windowFrom: extracted.windowFrom, windowTo: extracted.windowTo }
       : null;
+  }
+  if (field === "assets") return parseAssetsAnswer(text, opts);
+  if (field === "budgetSplit") {
+    const split = extractRequiredFromText(text, { awaiting: "budgetSplit" }).budgetSplit;
+    return split ? { budgetSplit: split } : null;
+  }
+  if (field === "assetClassMix") {
+    const policy = extractRequiredFromText(text, { awaiting: "assetClassMix" }).assetClassPolicy;
+    return policy ? { assetClassPolicy: policy } : null;
   }
   if (field === "startDate") {
-    const start = h.from ?? extractStartDateHint(text, { bareYear: true });
-    if (start) return applyStartDate(start);
-    // « depuis mon premier achat » uniquement si on a la date réelle
-    const t = text.toLowerCase();
-    if (
-      opts.firstTransactionDate &&
-      /\b(depuis\s+(mon\s+)?(premier|1er)\s+achat|depuis\s+le\s+debut|first\s+buy)\b/.test(
-        t.normalize("NFD").replace(/\p{M}/gu, ""),
-      )
-    ) {
-      return applyHorizon("since_first_buy", opts.firstTransactionDate);
+    if (extracted.from) {
+      return extracted.horizon === "since_first_buy" && opts.firstTransactionDate
+        ? applyHorizon("since_first_buy", opts.firstTransactionDate)
+        : applyStartDate(extracted.from);
     }
     return null;
   }
@@ -179,35 +169,11 @@ export function parseAllRequiredFromText(
   text: string,
   opts: ParseOpts = {},
 ): Partial<EditorState> {
-  // En attente de la date de début : ne touche JAMAIS au budget.
-  if (opts.awaiting === "startDate") {
-    return parseRequiredAnswer("startDate", text, opts) ?? {};
-  }
-
-  const base = hintsToPatch(
-    extractScheduleHints(text, {
-      defaultCurrency: opts.defaultCurrency,
-      // Loose uniquement quand on attend explicitement le montant.
-      looseBudget: opts.awaiting === "budget",
-    }),
-    opts,
-  );
-
-  const startPatch = parseRequiredAnswer("startDate", text, opts);
-  if (startPatch) Object.assign(base, startPatch);
-
-  // Filet : budget == année de la date de début → confusion, on ignore le budget.
-  if (
-    base.budgetAmount != null &&
-    base.from &&
-    base.budgetAmount >= 2010 &&
-    base.budgetAmount <= 2039 &&
-    String(base.from).startsWith(String(Math.trunc(base.budgetAmount)))
-  ) {
-    delete base.budgetAmount;
-  }
-
-  return base;
+  return extractRequiredFromText(text, {
+    awaiting: opts.awaiting,
+    defaultCurrency: opts.defaultCurrency,
+    firstTransactionDate: opts.firstTransactionDate,
+  }) as Partial<EditorState>;
 }
 
 export function extractExplicitPatch(
@@ -224,7 +190,11 @@ export function extractExplicitPatch(
 export function nextMissingQuestion(
   missing: RequiredFieldId[],
   currency = "EUR",
+  draft?: Partial<EditorState>,
 ): { id: RequiredFieldId; question: string } | null {
+  if (draft) {
+    return nextRequiredQuestion(draft as RequiredScheduleDraft, currency);
+  }
   const id = missing[0];
   if (!id) return null;
   return { id, question: questionFor(id, currency) };

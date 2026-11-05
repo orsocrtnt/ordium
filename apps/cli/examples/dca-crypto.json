@@ -1,0 +1,25 @@
+{
+  "name": "DCA crypto opportuniste",
+  "budget": { "amount": 1000, "currency": "EUR", "period": "monthly" },
+  "window": { "type": "day_of_month", "from": 1, "to": 7 },
+  "allocation": [
+    { "asset": "BTC", "weight": 0.6 },
+    { "asset": "ETH", "weight": 0.3 },
+    { "asset": "SOL", "weight": 0.1 }
+  ],
+  "splitting": { "tranches": 3, "distribution": "equal" },
+  "regime_adjustment": {
+    "indicator": "price_vs_sma200",
+    "reference_asset": "BTC",
+    "band_pct": 2,
+    "bull": { "budget_multiplier": 0.7 },
+    "neutral": { "budget_multiplier": 1 },
+    "bear": { "budget_multiplier": 1.5 }
+  },
+  "timing_rules": [
+    { "type": "dip_trigger", "drop_pct": 3 },
+    { "type": "rsi_below", "value": 40 },
+    { "type": "avoid_ath", "lookback_days": 90 }
+  ],
+  "cash_rules": { "min_cash_reserve_pct": 10 }
+}

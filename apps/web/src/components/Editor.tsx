@@ -6,8 +6,10 @@ import { fmtMoney } from "@/lib/format";
 import {
   monthsAgoIso,
   yesterdayIso,
+  indicatorMode,
   type EditorState,
   type ExtraBuyRow,
+  type IndicatorMode,
 } from "@/lib/strategy";
 
 interface EditorProps {
@@ -19,6 +21,44 @@ interface EditorProps {
   assetNames?: Map<string, string>;
   /** Pour le raccourci « depuis 1er achat ». */
   firstTransactionDate?: string | null;
+}
+
+function ModeSelect({
+  value,
+  onChange,
+  includeVeto,
+}: {
+  value: IndicatorMode | "veto";
+  onChange: (v: IndicatorMode | "veto") => void;
+  includeVeto?: boolean;
+}) {
+  return (
+    <label className="flex flex-col gap-1 text-xs text-[var(--muted)]">
+      Mode
+      <select
+        className="rounded-lg border border-[var(--border)] bg-white px-2 py-1.5 text-sm text-[var(--text)]"
+        value={value}
+        onChange={(e) => onChange(e.target.value as IndicatorMode | "veto")}
+      >
+        <option value="off">Désactivé</option>
+        <option value="gate">Acheter uniquement si</option>
+        <option value="scale">Ajuster le budget</option>
+        {includeVeto && <option value="veto">Bloquer si trop haut</option>}
+      </select>
+    </label>
+  );
+}
+
+function setSignalMode(
+  set: (p: Partial<EditorState>) => void,
+  gateKey: keyof EditorState,
+  scaleKey: keyof EditorState,
+  mode: IndicatorMode,
+) {
+  set({
+    [gateKey]: mode === "gate",
+    [scaleKey]: mode === "scale",
+  } as Partial<EditorState>);
 }
 
 function Section({
@@ -612,16 +652,39 @@ export function Editor({
 
       <Section
         title="Gestion du marché"
-        hint="Réduit le budget en hausse, l’augmente en baisse — selon la tendance."
+        hint="Chaque actif ajuste son budget selon sa propre tendance (SMA)."
         enabled={state.regimeEnabled}
         onToggle={(v) => set({ regimeEnabled: v })}
       >
         <p className="rounded-lg border border-[var(--border)] bg-[var(--accent-soft)]/60 px-3 py-2 text-[11px] leading-relaxed text-[var(--accent)]">
-          Tendance mesurée sur le{" "}
-          <span className="font-medium">MSCI World</span>
-          {" — "}le marché actions mondial pour ton portefeuille. Tu peux choisir un autre
-          indice de référence à la création.
+          {state.regimeScope === "reference" ? (
+            <>
+              Mode <span className="font-medium">indice unique</span> : un seul signal pilote
+              tous les actifs (même multiplicateur).
+            </>
+          ) : (
+            <>
+              Mode <span className="font-medium">chaque actif indépendant</span> : BTC, actions,
+              ETF… chacun compare son prix à sa propre SMA. Sur un même mois tu peux avoir ×2, ×1
+              et ÷2 en même temps.
+            </>
+          )}
         </p>
+        <label className="flex items-center justify-between gap-3 text-xs text-zinc-500">
+          <span>Mode</span>
+          <select
+            value={state.regimeScope === "reference" ? "reference" : "per_asset"}
+            onChange={(e) =>
+              set({
+                regimeScope: e.target.value === "reference" ? "reference" : "per_asset",
+              })
+            }
+            className={inputCls}
+          >
+            <option value="per_asset">Chaque actif indépendant (recommandé)</option>
+            <option value="reference">Un seul indice de référence</option>
+          </select>
+        </label>
         <SliderField
           label="Marché haussier : multiplier par"
           value={state.bullMult}
@@ -643,42 +706,52 @@ export function Editor({
         <AdvancedNest
           title="Définir haussier / baissier / neutre"
           summary={`${
-            regimeReferenceAsset.trim()
-              ? regimeReferenceAsset === "IWDA.AS"
-                ? "MSCI World"
-                : regimeReferenceAsset
-              : "plus gros poids"
+            state.regimeScope === "reference"
+              ? regimeReferenceAsset.trim()
+                ? regimeReferenceAsset === "IWDA.AS"
+                  ? "MSCI World"
+                  : regimeReferenceAsset
+                : "plus gros poids"
+              : "par actif"
           } · SMA ${state.regimeSmaPeriod}j · ±${state.regimeBandPct}%`}
         >
-          <label className="flex items-center justify-between gap-3 text-xs text-zinc-500">
-            <span>Indice / actif de référence</span>
-            <select
-              value={regimeReferenceAsset}
-              onChange={(e) => set({ regimeReferenceAsset: e.target.value })}
-              className={inputCls}
-            >
-              <option value="IWDA.AS">MSCI World (IWDA) — défaut</option>
-              <option value="CSPX.L">S&amp;P 500 (CSPX)</option>
-              <option value="">Plus gros poids de l’allocation</option>
-              {state.allocation
-                .filter(
-                  (a) =>
-                    a.pct > 0 &&
-                    a.asset !== "IWDA.AS" &&
-                    a.asset !== "IWDA" &&
-                    a.asset !== "CSPX.L",
-                )
-                .map((a) => (
-                  <option key={a.asset} value={a.asset}>
-                    {assetLabel(a.asset, assetNames)}
-                  </option>
-                ))}
-            </select>
-          </label>
-          <p className="text-[11px] text-zinc-500">
-            Change l’indice de référence ici si tu veux juger la tendance sur autre chose que le
-            MSCI World.
-          </p>
+          {state.regimeScope === "reference" ? (
+            <>
+              <label className="flex items-center justify-between gap-3 text-xs text-zinc-500">
+                <span>Indice / actif de référence</span>
+                <select
+                  value={regimeReferenceAsset}
+                  onChange={(e) => set({ regimeReferenceAsset: e.target.value })}
+                  className={inputCls}
+                >
+                  <option value="IWDA.AS">MSCI World (IWDA) — défaut</option>
+                  <option value="CSPX.L">S&amp;P 500 (CSPX)</option>
+                  <option value="">Plus gros poids de l’allocation</option>
+                  {state.allocation
+                    .filter(
+                      (a) =>
+                        a.pct > 0 &&
+                        a.asset !== "IWDA.AS" &&
+                        a.asset !== "IWDA" &&
+                        a.asset !== "CSPX.L",
+                    )
+                    .map((a) => (
+                      <option key={a.asset} value={a.asset}>
+                        {assetLabel(a.asset, assetNames)}
+                      </option>
+                    ))}
+                </select>
+              </label>
+              <p className="text-[11px] text-zinc-500">
+                Change l’indice de référence ici si tu veux juger la tendance sur autre chose que le
+                MSCI World.
+              </p>
+            </>
+          ) : (
+            <p className="text-[11px] leading-relaxed text-zinc-500">
+              Pas d’indice unique : BTC, actions, ETF… chacun compare son prix à sa propre SMA.
+            </p>
+          )}
           <SliderField
             label="Période SMA (jours)"
             value={state.regimeSmaPeriod}
@@ -710,40 +783,154 @@ export function Editor({
             suffix="×"
             onChange={(v) => set({ neutralMult: v })}
           />
+          <label className="flex items-start gap-2 text-xs text-zinc-600">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={state.fallbackNeutral !== false}
+              onChange={(e) => set({ fallbackNeutral: e.target.checked })}
+            />
+            <span>
+              Fin de fenêtre sans signal → verser le budget{" "}
+              <span className="font-medium">neutre (×{state.neutralMult})</span>, pas le
+              multiplicateur haussier/baissier.
+            </span>
+          </label>
         </AdvancedNest>
       </Section>
 
       <Section
-        title="Acheter les baisses"
-        hint="Déclenche un achat si le prix baisse dans la fenêtre"
-        enabled={state.dipEnabled}
-        onToggle={(v) => set({ dipEnabled: v })}
+        title="Acheter uniquement sur signal"
+        hint="Si activé : pas d’achat en fin de fenêtre tant qu’aucun déclencheur n’a matché"
+        enabled={state.requireSignal}
+        onToggle={(v) => set({ requireSignal: v })}
+      />
+
+      <Section
+        title="Baisse (dip)"
+        hint="Gate = acheter si baisse ; Scale = multiplier le budget selon la profondeur"
+        enabled={indicatorMode(state.dipEnabled, state.dipScaleEnabled) !== "off"}
+        onToggle={(v) =>
+          setSignalMode(set, "dipEnabled", "dipScaleEnabled", v ? "gate" : "off")
+        }
       >
-        <SliderField
-          label="Baisse déclenchante"
-          value={state.dipPct}
-          min={0.5}
-          max={50}
-          step={0.5}
-          suffix="%"
-          onChange={(v) => set({ dipPct: v })}
+        <ModeSelect
+          value={indicatorMode(state.dipEnabled, state.dipScaleEnabled)}
+          onChange={(m) => {
+            if (m === "veto") return;
+            setSignalMode(set, "dipEnabled", "dipScaleEnabled", m);
+          }}
         />
+        {state.dipScaleEnabled ? (
+          <>
+            <SliderField
+              label="Baisse profonde ≥"
+              value={state.dipDeepGte}
+              min={0.5}
+              max={50}
+              step={0.5}
+              suffix="%"
+              onChange={(v) => set({ dipDeepGte: v })}
+            />
+            <SliderField
+              label="alors ×"
+              value={state.dipDeepFactor}
+              min={0}
+              max={5}
+              step={0.1}
+              onChange={(v) => set({ dipDeepFactor: v })}
+            />
+            <SliderField
+              label="Calme (drawdown &lt;)"
+              value={state.dipCalmLt}
+              min={0}
+              max={50}
+              step={0.5}
+              suffix="%"
+              onChange={(v) => set({ dipCalmLt: v })}
+            />
+            <SliderField
+              label="alors ×"
+              value={state.dipCalmFactor}
+              min={0}
+              max={5}
+              step={0.1}
+              onChange={(v) => set({ dipCalmFactor: v })}
+            />
+          </>
+        ) : (
+          <SliderField
+            label="Baisse déclenchante"
+            value={state.dipPct}
+            min={0.5}
+            max={50}
+            step={0.5}
+            suffix="%"
+            onChange={(v) => set({ dipPct: v })}
+          />
+        )}
       </Section>
 
       <Section
-        title="Privilégier un RSI faible"
-        hint="Déclenche un achat quand le RSI passe sous le seuil (clôtures journalières)"
-        enabled={state.rsiEnabled}
-        onToggle={(v) => set({ rsiEnabled: v })}
+        title="RSI"
+        hint="Gate = acheter si RSI bas ; Scale = ×2 en survente, ×0.5 en surachat"
+        enabled={indicatorMode(state.rsiEnabled, state.rsiScaleEnabled) !== "off"}
+        onToggle={(v) =>
+          setSignalMode(set, "rsiEnabled", "rsiScaleEnabled", v ? "gate" : "off")
+        }
       >
-        <SliderField
-          label="Seuil RSI"
-          value={state.rsiValue}
-          min={1}
-          max={99}
-          step={1}
-          onChange={(v) => set({ rsiValue: v })}
+        <ModeSelect
+          value={indicatorMode(state.rsiEnabled, state.rsiScaleEnabled)}
+          onChange={(m) => {
+            if (m === "veto") return;
+            setSignalMode(set, "rsiEnabled", "rsiScaleEnabled", m);
+          }}
         />
+        {state.rsiScaleEnabled ? (
+          <>
+            <SliderField
+              label="RSI ≤"
+              value={state.rsiLowLte}
+              min={1}
+              max={99}
+              step={1}
+              onChange={(v) => set({ rsiLowLte: v })}
+            />
+            <SliderField
+              label="alors ×"
+              value={state.rsiLowFactor}
+              min={0}
+              max={5}
+              step={0.1}
+              onChange={(v) => set({ rsiLowFactor: v })}
+            />
+            <SliderField
+              label="RSI ≥"
+              value={state.rsiHighGte}
+              min={1}
+              max={99}
+              step={1}
+              onChange={(v) => set({ rsiHighGte: v })}
+            />
+            <SliderField
+              label="alors ×"
+              value={state.rsiHighFactor}
+              min={0}
+              max={5}
+              step={0.1}
+              onChange={(v) => set({ rsiHighFactor: v })}
+            />
+          </>
+        ) : (
+          <SliderField
+            label="Seuil RSI"
+            value={state.rsiValue}
+            min={1}
+            max={99}
+            step={1}
+            onChange={(v) => set({ rsiValue: v })}
+          />
+        )}
       </Section>
 
       <Section
@@ -783,10 +970,10 @@ export function Editor({
       <AdvancedZone
         activeCount={
           [
-            state.fearGreedEnabled,
-            state.macdEnabled,
-            state.bollingerEnabled,
-            state.smaBuyEnabled,
+            state.fearGreedEnabled || state.fearGreedScaleEnabled,
+            state.macdEnabled || state.macdScaleEnabled,
+            state.bollingerEnabled || state.bollingerScaleEnabled,
+            state.smaBuyEnabled || state.smaScaleEnabled,
             state.ddTiersEnabled,
             state.riseTiersEnabled,
             state.volEnabled,
@@ -798,52 +985,188 @@ export function Editor({
         <Section
           tone="advanced"
           title="Fear & Greed (crypto)"
-          hint="Index Alternative.me 0–100. Ex. ≤ 25 = Extreme Fear"
-          enabled={state.fearGreedEnabled}
-          onToggle={(v) => set({ fearGreedEnabled: v })}
+          hint="Gate = n’acheter que sous seuil ; Scale = ×2 peur / ×0.5 euphorie"
+          enabled={
+            indicatorMode(state.fearGreedEnabled, state.fearGreedScaleEnabled) !== "off"
+          }
+          onToggle={(v) =>
+            setSignalMode(set, "fearGreedEnabled", "fearGreedScaleEnabled", v ? "gate" : "off")
+          }
         >
-          <SliderField
-            label="Acheter si Fear & Greed ≤"
-            value={state.fearGreedValue}
-            min={0}
-            max={100}
-            step={1}
-            onChange={(v) => set({ fearGreedValue: v })}
+          <ModeSelect
+            value={indicatorMode(state.fearGreedEnabled, state.fearGreedScaleEnabled)}
+            onChange={(m) => {
+              if (m === "veto") return;
+              setSignalMode(set, "fearGreedEnabled", "fearGreedScaleEnabled", m);
+              if (m === "gate") set({ requireSignal: true });
+            }}
           />
+          {state.fearGreedScaleEnabled ? (
+            <>
+              <SliderField
+                label="Si Fear & Greed ≤"
+                value={state.fearGreedLowLte}
+                min={1}
+                max={99}
+                step={1}
+                onChange={(v) => set({ fearGreedLowLte: v })}
+              />
+              <SliderField
+                label="alors ×"
+                value={state.fearGreedLowFactor}
+                min={0}
+                max={5}
+                step={0.1}
+                onChange={(v) => set({ fearGreedLowFactor: v })}
+              />
+              <SliderField
+                label="Si Fear & Greed ≥"
+                value={state.fearGreedHighGte}
+                min={1}
+                max={99}
+                step={1}
+                onChange={(v) => set({ fearGreedHighGte: v })}
+              />
+              <SliderField
+                label="alors ×"
+                value={state.fearGreedHighFactor}
+                min={0}
+                max={5}
+                step={0.1}
+                onChange={(v) => set({ fearGreedHighFactor: v })}
+              />
+            </>
+          ) : (
+            <SliderField
+              label="Acheter si Fear & Greed ≤"
+              value={state.fearGreedValue}
+              min={0}
+              max={100}
+              step={1}
+              onChange={(v) => set({ fearGreedValue: v })}
+            />
+          )}
         </Section>
 
         <Section
           tone="advanced"
-          title="MACD positif"
-          hint="Acheter quand l’histogramme MACD (12/26/9) est > 0"
-          enabled={state.macdEnabled}
-          onToggle={(v) => set({ macdEnabled: v })}
-        />
-
-        <Section
-          tone="advanced"
-          title="Bollinger — bande basse"
-          hint="%B bas = prix près de la bande inférieure"
-          enabled={state.bollingerEnabled}
-          onToggle={(v) => set({ bollingerEnabled: v })}
+          title="MACD"
+          hint="Gate = hist > 0 ; Scale = × selon signe de l’histogramme"
+          enabled={indicatorMode(state.macdEnabled, state.macdScaleEnabled) !== "off"}
+          onToggle={(v) =>
+            setSignalMode(set, "macdEnabled", "macdScaleEnabled", v ? "gate" : "off")
+          }
         >
-          <SliderField
-            label="Seuil %B"
-            value={state.bollingerPctB}
-            min={0}
-            max={1}
-            step={0.01}
-            onChange={(v) => set({ bollingerPctB: v })}
+          <ModeSelect
+            value={indicatorMode(state.macdEnabled, state.macdScaleEnabled)}
+            onChange={(m) => {
+              if (m === "veto") return;
+              setSignalMode(set, "macdEnabled", "macdScaleEnabled", m);
+            }}
           />
+          {state.macdScaleEnabled && (
+            <>
+              <SliderField
+                label="Hist > 0 → ×"
+                value={state.macdPosFactor}
+                min={0}
+                max={5}
+                step={0.1}
+                onChange={(v) => set({ macdPosFactor: v })}
+              />
+              <SliderField
+                label="Hist < 0 → ×"
+                value={state.macdNegFactor}
+                min={0}
+                max={5}
+                step={0.1}
+                onChange={(v) => set({ macdNegFactor: v })}
+              />
+            </>
+          )}
         </Section>
 
         <Section
           tone="advanced"
-          title="Prix sous SMA"
-          hint="Acheter si le prix de clôture est sous la moyenne mobile"
-          enabled={state.smaBuyEnabled}
-          onToggle={(v) => set({ smaBuyEnabled: v })}
+          title="Bollinger %B"
+          hint="Gate = bande basse ; Scale = ×2 bas / ×0.5 haut"
+          enabled={
+            indicatorMode(state.bollingerEnabled, state.bollingerScaleEnabled) !== "off"
+          }
+          onToggle={(v) =>
+            setSignalMode(set, "bollingerEnabled", "bollingerScaleEnabled", v ? "gate" : "off")
+          }
         >
+          <ModeSelect
+            value={indicatorMode(state.bollingerEnabled, state.bollingerScaleEnabled)}
+            onChange={(m) => {
+              if (m === "veto") return;
+              setSignalMode(set, "bollingerEnabled", "bollingerScaleEnabled", m);
+            }}
+          />
+          {state.bollingerScaleEnabled ? (
+            <>
+              <SliderField
+                label="%B ≤"
+                value={state.bollingerLowLte}
+                min={0}
+                max={1}
+                step={0.01}
+                onChange={(v) => set({ bollingerLowLte: v })}
+              />
+              <SliderField
+                label="alors ×"
+                value={state.bollingerLowFactor}
+                min={0}
+                max={5}
+                step={0.1}
+                onChange={(v) => set({ bollingerLowFactor: v })}
+              />
+              <SliderField
+                label="%B ≥"
+                value={state.bollingerHighGte}
+                min={0}
+                max={1}
+                step={0.01}
+                onChange={(v) => set({ bollingerHighGte: v })}
+              />
+              <SliderField
+                label="alors ×"
+                value={state.bollingerHighFactor}
+                min={0}
+                max={5}
+                step={0.1}
+                onChange={(v) => set({ bollingerHighFactor: v })}
+              />
+            </>
+          ) : (
+            <SliderField
+              label="Seuil %B"
+              value={state.bollingerPctB}
+              min={0}
+              max={1}
+              step={0.01}
+              onChange={(v) => set({ bollingerPctB: v })}
+            />
+          )}
+        </Section>
+
+        <Section
+          tone="advanced"
+          title="Prix vs SMA"
+          hint="Gate = acheter sous SMA ; Scale = × selon position"
+          enabled={indicatorMode(state.smaBuyEnabled, state.smaScaleEnabled) !== "off"}
+          onToggle={(v) =>
+            setSignalMode(set, "smaBuyEnabled", "smaScaleEnabled", v ? "gate" : "off")
+          }
+        >
+          <ModeSelect
+            value={indicatorMode(state.smaBuyEnabled, state.smaScaleEnabled)}
+            onChange={(m) => {
+              if (m === "veto") return;
+              setSignalMode(set, "smaBuyEnabled", "smaScaleEnabled", m);
+            }}
+          />
           <SliderField
             label="Période SMA"
             value={state.smaBuyPeriod}
@@ -852,6 +1175,26 @@ export function Editor({
             step={1}
             onChange={(v) => set({ smaBuyPeriod: v })}
           />
+          {state.smaScaleEnabled && (
+            <>
+              <SliderField
+                label="Sous SMA → ×"
+                value={state.smaBelowFactor}
+                min={0}
+                max={5}
+                step={0.1}
+                onChange={(v) => set({ smaBelowFactor: v })}
+              />
+              <SliderField
+                label="Au-dessus → ×"
+                value={state.smaAboveFactor}
+                min={0}
+                max={5}
+                step={0.1}
+                onChange={(v) => set({ smaAboveFactor: v })}
+              />
+            </>
+          )}
         </Section>
 
         <Section
@@ -983,8 +1326,9 @@ export function Editor({
               onChange={(e) => set({ volMode: e.target.value as EditorState["volMode"] })}
               className={inputCls}
             >
-              <option value="veto">bloquer l&apos;achat</option>
-              <option value="scale">réduire le budget</option>
+              <option value="veto">bloquer l&apos;achat si vol haute</option>
+              <option value="scale">réduire le budget si vol haute</option>
+              <option value="gate">n&apos;acheter que si vol ≤ seuil</option>
             </select>
           </label>
           {state.volMode === "scale" && (

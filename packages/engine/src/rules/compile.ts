@@ -145,6 +145,20 @@ export function compileStrategy(strategy: Strategy): RuleDocument {
           priority: 22,
           enabled: true,
         });
+      } else if (tr.mode === "gate") {
+        rules.push({
+          id: `trigger-vol-lte-${tr.max_vol_pct}`,
+          when: "tick",
+          if: {
+            type: "volatility",
+            period,
+            op: "lte",
+            value: tr.max_vol_pct,
+          },
+          then: [{ action: "buy_tranche" }],
+          priority: 50,
+          enabled: true,
+        });
       } else {
         rules.push({
           id: `scale-vol-${tr.max_vol_pct}`,
@@ -192,6 +206,127 @@ export function compileStrategy(strategy: Strategy): RuleDocument {
         if: { type: "fear_greed", op: "lte", value: tr.value },
         then: [{ action: "buy_tranche" }],
         priority: 50,
+        enabled: true,
+      });
+    }
+    if (tr.type === "fear_greed_scale") {
+      rules.push({
+        id: `scale-fng-low-${tr.low_lte}`,
+        when: "window_open",
+        if: { type: "fear_greed", op: "lte", value: tr.low_lte },
+        then: [{ action: "scale_budget", factor: tr.low_factor }],
+        priority: 14,
+        enabled: true,
+      });
+      rules.push({
+        id: `scale-fng-high-${tr.high_gte}`,
+        when: "window_open",
+        if: { type: "fear_greed", op: "gte", value: tr.high_gte },
+        then: [{ action: "scale_budget", factor: tr.high_factor }],
+        priority: 14,
+        enabled: true,
+      });
+    }
+    if (tr.type === "dip_scale") {
+      const lookback = 30;
+      rules.push({
+        id: `scale-dip-deep-${tr.deep_gte_pct}`,
+        when: "window_open",
+        if: {
+          type: "drawdown",
+          lookback_days: lookback,
+          op: "gte",
+          value: tr.deep_gte_pct,
+        },
+        then: [{ action: "scale_budget", factor: tr.deep_factor }],
+        priority: 14,
+        enabled: true,
+      });
+      rules.push({
+        id: `scale-dip-calm-${tr.calm_lt_pct}`,
+        when: "window_open",
+        if: {
+          type: "drawdown",
+          lookback_days: lookback,
+          op: "lt",
+          value: Math.max(tr.calm_lt_pct, 0.01),
+        },
+        then: [{ action: "scale_budget", factor: tr.calm_factor }],
+        priority: 14,
+        enabled: true,
+      });
+    }
+    if (tr.type === "rsi_scale") {
+      const period = tr.period ?? 14;
+      rules.push({
+        id: `scale-rsi-low-${tr.low_lte}`,
+        when: "window_open",
+        if: { type: "rsi", period, op: "lte", value: tr.low_lte },
+        then: [{ action: "scale_budget", factor: tr.low_factor }],
+        priority: 14,
+        enabled: true,
+      });
+      rules.push({
+        id: `scale-rsi-high-${tr.high_gte}`,
+        when: "window_open",
+        if: { type: "rsi", period, op: "gte", value: tr.high_gte },
+        then: [{ action: "scale_budget", factor: tr.high_factor }],
+        priority: 14,
+        enabled: true,
+      });
+    }
+    if (tr.type === "macd_scale") {
+      rules.push({
+        id: `scale-macd-pos-${tr.pos_gt}`,
+        when: "window_open",
+        if: { type: "macd", op: "gt", value: tr.pos_gt },
+        then: [{ action: "scale_budget", factor: tr.pos_factor }],
+        priority: 14,
+        enabled: true,
+      });
+      rules.push({
+        id: `scale-macd-neg-${tr.neg_lt}`,
+        when: "window_open",
+        if: { type: "macd", op: "lt", value: tr.neg_lt },
+        then: [{ action: "scale_budget", factor: tr.neg_factor }],
+        priority: 14,
+        enabled: true,
+      });
+    }
+    if (tr.type === "bollinger_scale") {
+      const period = tr.period ?? 20;
+      rules.push({
+        id: `scale-bb-low-${tr.low_lte}`,
+        when: "window_open",
+        if: { type: "bollinger", period, op: "lte", value: tr.low_lte },
+        then: [{ action: "scale_budget", factor: tr.low_factor }],
+        priority: 14,
+        enabled: true,
+      });
+      rules.push({
+        id: `scale-bb-high-${tr.high_gte}`,
+        when: "window_open",
+        if: { type: "bollinger", period, op: "gte", value: tr.high_gte },
+        then: [{ action: "scale_budget", factor: tr.high_factor }],
+        priority: 14,
+        enabled: true,
+      });
+    }
+    if (tr.type === "sma_scale") {
+      rules.push({
+        id: `scale-sma-below-${tr.period}`,
+        when: "window_open",
+        if: { type: "price_vs_sma", period: tr.period, op: "lt" },
+        then: [{ action: "scale_budget", factor: tr.below_factor }],
+        priority: 14,
+        enabled: true,
+      });
+      rules.push({
+        id: `scale-sma-above-${tr.period}`,
+        when: "window_open",
+        if: { type: "price_vs_sma", period: tr.period, op: "gt" },
+        then: [{ action: "scale_budget", factor: tr.above_factor }],
+        priority: 14,
         enabled: true,
       });
     }
@@ -261,14 +396,16 @@ export function compileStrategy(strategy: Strategy): RuleDocument {
     }
   }
 
-  // Règle produit non négociable : le DCA est toujours honoré.
-  rules.push({
-    id: "fallback-window-end",
-    when: "window_end",
-    then: [{ action: "buy_remaining", reason: "fallback : fin de fenêtre" }],
-    priority: 200,
-    enabled: true,
-  });
+  // Fallback fin de fenêtre : honoré sauf si require_signal (acheter uniquement si).
+  if (!strategy.require_signal) {
+    rules.push({
+      id: "fallback-window-end",
+      when: "window_end",
+      then: [{ action: "buy_remaining", reason: "fallback : fin de fenêtre" }],
+      priority: 200,
+      enabled: true,
+    });
+  }
 
   const constraints = [];
   if (strategy.cash_rules?.min_cash_reserve_pct != null) {
@@ -289,7 +426,10 @@ export function compileStrategy(strategy: Strategy): RuleDocument {
         window: strategy.window,
         allocation: strategy.allocation,
         splitting: strategy.splitting,
-        reference_asset: strategy.regime_adjustment?.reference_asset,
+        reference_asset:
+          strategy.regime_adjustment?.scope === "reference"
+            ? strategy.regime_adjustment?.reference_asset
+            : undefined,
         regime_band_pct: strategy.regime_adjustment?.band_pct ?? 2,
         regime_sma_period: strategy.regime_adjustment?.sma_period ?? 200,
       },
@@ -331,11 +471,13 @@ export function decompileToStrategy(doc: RuleDocument): Strategy {
     regime_adjustment = {
       indicator: "price_vs_sma",
       sma_period: plan.regime_sma_period ?? 200,
+      scope: plan.reference_asset ? "reference" : "per_asset",
       reference_asset: plan.reference_asset,
       band_pct: plan.regime_band_pct,
       bull: { budget_multiplier: factor(bull) },
       neutral: { budget_multiplier: factor(neutral) },
       bear: { budget_multiplier: factor(bear) },
+      fallback_budget: "neutral",
     };
   }
 
@@ -361,6 +503,47 @@ export function decompileToStrategy(doc: RuleDocument): Strategy {
       if (scale && leaf) {
         riseTiers.push({ gte_pct: leaf.value, factor: scale.factor });
         if (leaf.lookback_days) tierLookback = leaf.lookback_days;
+      }
+      continue;
+    }
+
+    if (rule.when === "window_open" && rule.id.startsWith("scale-fng-")) {
+      const scale = rule.then.find(
+        (a): a is Extract<Action, { action: "scale_budget" }> => a.action === "scale_budget",
+      );
+      const cond = flattenLeaf(rule.if);
+      if (scale && cond?.type === "fear_greed") {
+        const existing = timing_rules.find(
+          (r): r is Extract<NonNullable<Strategy["timing_rules"]>[number], { type: "fear_greed_scale" }> =>
+            r.type === "fear_greed_scale",
+        );
+        if (rule.id.startsWith("scale-fng-low-")) {
+          if (existing) {
+            existing.low_lte = cond.value;
+            existing.low_factor = scale.factor;
+          } else {
+            timing_rules.push({
+              type: "fear_greed_scale",
+              low_lte: cond.value,
+              low_factor: scale.factor,
+              high_gte: 80,
+              high_factor: 0.5,
+            });
+          }
+        } else if (rule.id.startsWith("scale-fng-high-")) {
+          if (existing) {
+            existing.high_gte = cond.value;
+            existing.high_factor = scale.factor;
+          } else {
+            timing_rules.push({
+              type: "fear_greed_scale",
+              low_lte: 35,
+              low_factor: 2,
+              high_gte: cond.value,
+              high_factor: scale.factor,
+            });
+          }
+        }
       }
       continue;
     }

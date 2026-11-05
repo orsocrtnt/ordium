@@ -9,8 +9,8 @@ import { apiFetch } from "@/lib/api";
 import { assetLabel, nameMapFromHoldings } from "@/lib/assets";
 import type { PortfolioPayload } from "@/lib/types";
 import {
+  allocationFromPortfolio,
   horizonLabel,
-  isDefaultCryptoAllocation,
   seedStateFromPortfolio,
   toStrategyDocument,
   type AllocationRow,
@@ -26,6 +26,15 @@ import {
   type StoredChatMessage,
 } from "@/lib/strategyStore";
 import { scrubYearBudget, isSuspiciousYearBudget } from "@/lib/strategyRequired";
+import { checkStrategyBrokerCompatibility } from "@/lib/brokerCompatibility";
+import { scopedStorageKey } from "@/lib/userScope";
+import {
+  fetchExecutionStatus,
+  hasPaperExecutionConnection,
+  pickPaperConnection,
+  syncStrategyPaperSchedule,
+  type ExecutionScheduleInfo,
+} from "@/lib/executionPaper";
 import { AllocationQuestionnaire } from "./AllocationQuestionnaire";
 import { Editor } from "./Editor";
 import { emptyHolding, HoldingsEditor, withDerivedPnl } from "./HoldingsEditor";
@@ -76,6 +85,7 @@ export function Builder({ hidePortfolioPanel = false }: BuilderProps) {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [showResults, setShowResults] = useState(false);
   const [showAllocQuiz, setShowAllocQuiz] = useState(false);
+  const [chatOpen, setChatOpen] = useState(false);
 
   const [strategies, setStrategies] = useState<SavedStrategy[]>([]);
   const [activeId, setActiveId] = useState<string>("");
@@ -95,6 +105,13 @@ export function Builder({ hidePortfolioPanel = false }: BuilderProps) {
   const [stale, setStale] = useState(false);
   const [apiDown, setApiDown] = useState(false);
   const [positionsOpen, setPositionsOpen] = useState(false);
+  /** Popup : activation impossible sans broker. */
+  const [brokerRequiredOpen, setBrokerRequiredOpen] = useState(false);
+  /** Popup : il faut d’abord avoir simulé. */
+  const [needSimulationOpen, setNeedSimulationOpen] = useState(false);
+  /** Schedule paper lié à la strat active (feedback UI). */
+  const [paperSchedule, setPaperSchedule] = useState<ExecutionScheduleInfo | null>(null);
+  const [activateMsg, setActivateMsg] = useState<string | null>(null);
   const [draftHoldings, setDraftHoldings] = useState<Holding[]>([]);
   const [positionsBusy, setPositionsBusy] = useState(false);
   const [positionsError, setPositionsError] = useState<string | null>(null);
@@ -103,6 +120,16 @@ export function Builder({ hidePortfolioPanel = false }: BuilderProps) {
   const hasRealHistory = (portfolio?.portfolio.transactions.length ?? 0) > 0;
   /** Empreinte du dernier run réussi — pour marquer stale sans recalcul auto. */
   const lastRunKeyRef = useRef<string | null>(null);
+  const activeNav: "chat" | "positions" | "assets" | "simulation" | "settings" =
+    settingsOpen
+      ? "settings"
+      : positionsOpen
+        ? "positions"
+        : showAllocQuiz
+          ? "assets"
+          : !chatOpen && showResults
+            ? "simulation"
+            : "chat";
 
   useEffect(() => {
     const store = loadStrategyStore();
@@ -132,7 +159,7 @@ export function Builder({ hidePortfolioPanel = false }: BuilderProps) {
     if (!pending) return;
     pendingStoreRef.current = null;
     saveStrategyStore({
-      version: 1,
+      version: 3,
       activeId: pending.activeId,
       strategies: pending.strategies,
     });
@@ -322,8 +349,11 @@ export function Builder({ hidePortfolioPanel = false }: BuilderProps) {
       seededRef.current = true;
       setPositionsOpen(false);
       void refreshAssets();
-      setShowAllocQuiz(true);
-      setShowResults(false);
+      // Première sim uniquement : sinon on garde les actifs déjà choisis.
+      if (!active?.assetsConfirmed) {
+        setShowAllocQuiz(true);
+        setShowResults(false);
+      }
     } catch (err) {
       setPositionsError((err as Error).message);
     } finally {
@@ -378,6 +408,7 @@ export function Builder({ hidePortfolioPanel = false }: BuilderProps) {
       abortRef.current = controller;
       const key = backtestKey(s);
       setLoading(true);
+      setChatOpen(false);
       setShowResults(true);
       setShowAllocQuiz(false);
       try {
@@ -421,11 +452,68 @@ export function Builder({ hidePortfolioPanel = false }: BuilderProps) {
     [state, apiDown, hasRealHistory, backtestKey],
   );
 
+  const markAssetsConfirmed = useCallback(() => {
+    if (!activeId) return;
+    setStrategies((prev) => {
+      const next = prev.map((s) =>
+        s.id === activeId
+          ? { ...s, assetsConfirmed: true, updatedAt: new Date().toISOString() }
+          : s,
+      );
+      scheduleStore(next, activeId);
+      return next;
+    });
+  }, [activeId, scheduleStore]);
+
+  /** Garantit une allocation = tous les actifs du portefeuille si vide. */
+  const ensureAllAssetsAllocation = useCallback((): AllocationRow[] | null => {
+    if (!state) return null;
+    if (state.allocation.some((a) => a.pct > 0)) return state.allocation;
+    if (!portfolio) return null;
+    return allocationFromPortfolio(portfolio);
+  }, [state, portfolio]);
+
+  /**
+   * Lance la simulation. Première fois d’une strat → questionnaire d’actifs.
+   * Ensuite → on garde l’allocation (tous les actifs par défaut).
+   */
+  const startSimulation = useCallback(() => {
+    if (!state || apiDown) return;
+
+    if (!active?.assetsConfirmed) {
+      if (portfolio && !state.allocation.some((a) => a.pct > 0)) {
+        const alloc = allocationFromPortfolio(portfolio);
+        if (alloc?.length) setState((s) => ({ ...s, allocation: alloc }));
+      }
+      setChatOpen(false);
+      setShowResults(false);
+      setShowAllocQuiz(true);
+      return;
+    }
+
+    const alloc = ensureAllAssetsAllocation();
+    if (alloc && alloc !== state.allocation) {
+      setState((s) => ({ ...s, allocation: alloc }));
+      void runBacktest({ allocation: alloc });
+      return;
+    }
+    void runBacktest();
+  }, [
+    state,
+    apiDown,
+    active?.assetsConfirmed,
+    portfolio,
+    setState,
+    ensureAllAssetsAllocation,
+    runBacktest,
+  ]);
+
   const selectStrategy = (id: string) => {
     persist(strategies, id);
     setPayload(null);
     lastRunKeyRef.current = null;
     setStale(false);
+    setChatOpen(false);
     setShowResults(false);
     setShowAllocQuiz(false);
   };
@@ -436,16 +524,145 @@ export function Builder({ hidePortfolioPanel = false }: BuilderProps) {
     setPayload(null);
     lastRunKeyRef.current = null;
     setStale(false);
+    setChatOpen(false);
     setShowResults(false);
     setShowAllocQuiz(false);
   };
 
+  const refreshPaperSchedule = useCallback(async (strategyId: string) => {
+    const status = await fetchExecutionStatus();
+    const found =
+      status?.schedules.find((s) => s.strategyId === strategyId && s.enabled) ?? null;
+    setPaperSchedule(found);
+  }, []);
+
+  useEffect(() => {
+    if (!activeId || !active?.enabled) {
+      setPaperSchedule(null);
+      return;
+    }
+    void refreshPaperSchedule(activeId);
+  }, [activeId, active?.enabled, refreshPaperSchedule]);
+
+  const checkBrokerConnected = useCallback(async (): Promise<boolean> => {
+    return hasPaperExecutionConnection();
+  }, []);
+
   const toggleEnabled = (id: string) => {
-    const target = strategies.find((s) => s.id === id);
-    const turningOn = target ? !target.enabled : true;
-    // Une seule activée : activer celle-ci désactive automatiquement les autres
-    const next = withExclusiveEnabled(strategies, turningOn ? id : null);
-    persist(next, activeId);
+    void (async () => {
+      const target = strategies.find((s) => s.id === id);
+      const turningOn = target ? !target.enabled : true;
+      if (turningOn) {
+        if (id !== activeId || !payload) {
+          setNeedSimulationOpen(true);
+          return;
+        }
+        const ok = await checkBrokerConnected();
+        if (!ok) {
+          setBrokerRequiredOpen(true);
+          return;
+        }
+        const status = await fetchExecutionStatus();
+        const conn = status ? pickPaperConnection(status.connections) : null;
+        if (conn && state) {
+          const compat = checkStrategyBrokerCompatibility(
+            toStrategyDocument(state) as {
+              allocation?: Array<{ asset?: string; weight?: number }>;
+            },
+            conn.broker,
+          );
+          if (!compat.ok) {
+            setActivateMsg(compat.message ?? "Stratégie incompatible avec le broker.");
+            return;
+          }
+        }
+      }
+      const next = withExclusiveEnabled(strategies, turningOn ? id : null);
+      persist(next, activeId);
+
+      if (state && id === activeId) {
+        const sync = await syncStrategyPaperSchedule({
+          strategyId: id,
+          strategyJson: toStrategyDocument(state),
+          amount: state.budgetAmount,
+          enabled: turningOn,
+        });
+        if ("error" in sync) {
+          setActivateMsg(sync.error);
+          if (turningOn) {
+            persist(withExclusiveEnabled(next, null), activeId);
+          }
+          return;
+        }
+        setPaperSchedule(sync.schedule.enabled ? sync.schedule : null);
+        setActivateMsg(
+          turningOn
+            ? `Paper ${sync.connection.broker} activé — une seule strat à la fois.`
+            : "Automatisation paper en pause.",
+        );
+      }
+    })();
+  };
+
+  /** Activer depuis la simulation (après analyse) — sinon popup broker. */
+  const activateFromSimulation = () => {
+    if (!activeId || !state) return;
+    void (async () => {
+      setActivateMsg(null);
+      if (active?.enabled) {
+        const sync = await syncStrategyPaperSchedule({
+          strategyId: activeId,
+          strategyJson: toStrategyDocument(state),
+          amount: state.budgetAmount,
+          enabled: false,
+        });
+        const next = withExclusiveEnabled(strategies, null);
+        persist(next, activeId);
+        setPaperSchedule(null);
+        setActivateMsg(
+          "error" in sync ? sync.error : "Stratégie désactivée — paper en pause.",
+        );
+        return;
+      }
+      const ok = await checkBrokerConnected();
+      if (!ok) {
+        setBrokerRequiredOpen(true);
+        return;
+      }
+      const status = await fetchExecutionStatus();
+      const conn = status ? pickPaperConnection(status.connections) : null;
+      if (conn) {
+        const compat = checkStrategyBrokerCompatibility(
+          toStrategyDocument(state) as {
+            allocation?: Array<{ asset?: string; weight?: number }>;
+          },
+          conn.broker,
+        );
+        if (!compat.ok) {
+          setActivateMsg(compat.message ?? "Stratégie incompatible avec le broker.");
+          return;
+        }
+      }
+      const sync = await syncStrategyPaperSchedule({
+        strategyId: activeId,
+        strategyJson: toStrategyDocument(state),
+        amount: state.budgetAmount,
+        enabled: true,
+      });
+      if ("error" in sync) {
+        setActivateMsg(sync.error);
+        setBrokerRequiredOpen(true);
+        return;
+      }
+      const next = withExclusiveEnabled(strategies, activeId);
+      persist(next, activeId);
+      setPaperSchedule(sync.schedule);
+      setActivateMsg(
+        `Paper ${sync.connection.broker} · auto active (seule strat). Prochain run : ${new Date(
+          sync.schedule.nextRunAt,
+        ).toLocaleString("fr-FR")}.`,
+      );
+    })();
   };
 
   const renameStrategy = (id: string, name: string, { commit }: { commit: boolean }) => {
@@ -469,7 +686,7 @@ export function Builder({ hidePortfolioPanel = false }: BuilderProps) {
           ? { ...s, messages, updatedAt: new Date().toISOString() }
           : s,
       );
-      saveStrategyStore({ version: 1, activeId, strategies: next });
+      saveStrategyStore({ version: 3, activeId, strategies: next });
       return next;
     });
   };
@@ -547,13 +764,13 @@ export function Builder({ hidePortfolioPanel = false }: BuilderProps) {
           })}
         </div>
         <div className="border-t border-[var(--border)] px-3 py-3 text-[10px] leading-relaxed text-[var(--muted)]">
-          Pastille verte = seule stratégie activée. En activer une désactive les autres.
+          Pastille verte = stratégie activée (après simulation + broker). Une seule à la fois.
         </div>
       </aside>
 
       {/* Main */}
       <div className="flex min-w-0 flex-1 flex-col">
-        <header className="flex h-12 shrink-0 items-center justify-between gap-3 border-b border-[var(--border)] bg-[var(--bg-elevated)] px-3 sm:px-4">
+        <header className="flex min-h-12 shrink-0 items-center justify-between gap-3 border-b border-[var(--border)] bg-[var(--bg-elevated)] px-3 sm:px-4">
           <div className="flex min-w-0 items-center gap-2">
             <button
               type="button"
@@ -576,39 +793,97 @@ export function Builder({ hidePortfolioPanel = false }: BuilderProps) {
               className="min-w-0 max-w-[200px] bg-transparent text-sm font-medium text-[var(--text)] outline-none sm:max-w-xs"
               title="Renommer"
             />
+            <button
+              type="button"
+              disabled={loading || apiDown}
+              onClick={() => void (active?.assetsConfirmed ? runBacktest() : startSimulation())}
+              className="rounded-full border border-[var(--border)] bg-white px-3 py-1.5 text-xs font-medium text-[var(--muted)] transition hover:text-[var(--text)] disabled:opacity-50"
+            >
+              {loading ? "Calcul…" : "Recalculer"}
+            </button>
           </div>
-          <div className="flex shrink-0 items-center gap-1.5 sm:gap-2">
+          <div className="flex shrink-0 flex-wrap items-center gap-1.5 sm:gap-2">
             <button
               type="button"
               onClick={() => {
-                if (showAllocQuiz) {
-                  setShowAllocQuiz(false);
-                  return;
-                }
-                if (showResults) {
-                  setShowResults(false);
-                  return;
-                }
-                // Vers résultats : passer par le choix d’actifs.
-                setShowAllocQuiz(true);
+                setChatOpen(true);
+                setShowAllocQuiz(false);
               }}
-              className="rounded-md px-2.5 py-1.5 text-xs text-[var(--muted)] hover:bg-[#efefec] hover:text-[var(--text)]"
+              className={`rounded-full border px-3 py-1.5 text-xs font-medium transition ${
+                activeNav === "chat"
+                  ? "border-[var(--border)] bg-[#efefec] text-[var(--text)]"
+                  : "border-[var(--border)] bg-white text-[var(--muted)] hover:text-[var(--text)]"
+              }`}
             >
-              {showAllocQuiz || showResults ? "Chat" : "Résultats"}
+              Chat
             </button>
             <button
               type="button"
               onClick={openPositions}
-              className="hidden rounded-md px-2.5 py-1.5 text-xs text-[var(--muted)] hover:bg-[#efefec] hover:text-[var(--text)] md:inline"
+              className={`rounded-full border px-3 py-1.5 text-xs font-medium transition ${
+                activeNav === "positions"
+                  ? "border-[var(--border)] bg-[#efefec] text-[var(--text)]"
+                  : "border-[var(--border)] bg-white text-[var(--muted)] hover:text-[var(--text)]"
+              }`}
             >
               Positions
             </button>
             <button
               type="button"
               onClick={() => {
+                setChatOpen(false);
+                setShowResults(false);
+                setShowAllocQuiz(true);
+              }}
+              className={`rounded-full border px-3 py-1.5 text-xs font-medium transition ${
+                activeNav === "assets"
+                  ? "border-[var(--border)] bg-[#efefec] text-[var(--text)]"
+                  : "border-[var(--border)] bg-white text-[var(--muted)] hover:text-[var(--text)]"
+              }`}
+            >
+              Changer les actifs
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setChatOpen(false);
+                // Si on vient du changement d’actifs sans recalcul, on revient sur la dernière
+                // simulation affichée (payload conservé) — sans repasser par un backtest.
+                if (showAllocQuiz) {
+                  if (payload) {
+                    setShowAllocQuiz(false);
+                    setShowResults(true);
+                  }
+                  return;
+                }
+                if (showResults) return;
+                startSimulation();
+              }}
+              className={`rounded-full border px-3 py-1.5 text-xs font-medium transition ${
+                activeNav === "simulation"
+                  ? "border-[var(--border)] bg-[#efefec] text-[var(--text)]"
+                  : "border-[var(--border)] bg-white text-[var(--muted)] hover:text-[var(--text)]"
+              }`}
+            >
+              Simulation
+            </button>
+            <button
+              type="button"
+              onClick={() => setSettingsOpen(true)}
+              className={`rounded-full border px-3 py-1.5 text-xs font-medium transition ${
+                activeNav === "settings"
+                  ? "border-[var(--border)] bg-[#efefec] text-[var(--text)]"
+                  : "border-[var(--border)] bg-white text-[var(--muted)] hover:text-[var(--text)]"
+              }`}
+            >
+              Réglages
+            </button>
+            <button
+              type="button"
+              onClick={() => {
                 try {
                   sessionStorage.setItem(
-                    "ordium_pending_strategy",
+                    scopedStorageKey("ordium_pending_strategy"),
                     JSON.stringify(toStrategyDocument(state)),
                   );
                 } catch {
@@ -616,17 +891,13 @@ export function Builder({ hidePortfolioPanel = false }: BuilderProps) {
                 }
                 window.location.href = "/execution?from=strategy";
               }}
-              className="rounded-md px-2.5 py-1.5 text-xs text-[var(--muted)] hover:bg-[#efefec] hover:text-[var(--text)]"
+              className="rounded-full border border-[var(--border)] bg-white px-3 py-1.5 text-xs font-medium text-[var(--muted)] transition hover:text-[var(--text)]"
             >
               Automatiser
             </button>
-            <button
-              type="button"
-              onClick={() => setSettingsOpen(true)}
-              className="rounded-lg bg-[var(--text)] px-3 py-1.5 text-xs font-medium text-white hover:bg-[#2a2a2a]"
-            >
-              Réglages
-            </button>
+            {showResults && stale && payload ? (
+              <span className="text-xs text-amber-700 whitespace-nowrap">Réglages modifiés</span>
+            ) : null}
           </div>
         </header>
 
@@ -646,53 +917,29 @@ export function Builder({ hidePortfolioPanel = false }: BuilderProps) {
                 budgetAmount={state.budgetAmount}
                 currency={state.currency}
                 period={state.period}
-                initialAllocation={
-                  isDefaultCryptoAllocation(state.allocation) ? [] : state.allocation
-                }
+                initialAllocation={state.allocation}
                 onCancel={() => setShowAllocQuiz(false)}
                 onConfirm={(allocation: AllocationRow[]) => {
                   setState((s) => ({ ...s, allocation }));
+                  markAssetsConfirmed();
                   seededRef.current = true;
+                  setChatOpen(false);
                   setShowAllocQuiz(false);
                   void runBacktest({ allocation });
                   void refreshAssets();
                 }}
               />
             </div>
-          ) : showResults ? (
+          ) : !chatOpen && showResults ? (
             <div className="h-full overflow-y-auto px-3 py-5 sm:px-5 lg:px-6">
               <div className="mx-auto w-full max-w-[1600px]">
-                <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
-                  <p className="text-xs text-[var(--muted)]">
-                    Actifs simulés :{" "}
-                    {state.allocation
-                      .filter((a) => a.pct > 0)
-                      .map((a) => `${assetLabel(a.asset, assetNames)} ${a.pct.toFixed(0)}%`)
-                      .join(" · ") || "—"}
-                    {stale && payload ? (
-                      <span className="ml-2 text-amber-700">· réglages modifiés</span>
-                    ) : null}
+                <div className="mb-6 text-center">
+                  <h1 className="text-xl font-semibold tracking-tight text-[var(--text)] sm:text-2xl">
+                    Test de votre stratégie
+                  </h1>
+                  <p className="mt-1 text-xs text-[var(--muted)]">
+                    Les performances passées ne présagent pas des performances futures.
                   </p>
-                  <div className="flex flex-wrap items-center gap-2">
-                    <button
-                      type="button"
-                      disabled={loading || apiDown}
-                      onClick={() => void runBacktest()}
-                      className="rounded-lg bg-[var(--text)] px-2.5 py-1 text-xs font-medium text-white hover:bg-[#2a2a2a] disabled:opacity-50"
-                    >
-                      {loading ? "Calcul…" : "Recalculer"}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setShowResults(false);
-                        setShowAllocQuiz(true);
-                      }}
-                      className="rounded-lg border border-[var(--border)] px-2.5 py-1 text-xs text-[var(--muted)] hover:text-[var(--text)]"
-                    >
-                      Changer les actifs
-                    </button>
-                  </div>
                 </div>
                 {error ? (
                   <p className="rounded-xl border border-red-200 bg-red-50 p-4 text-sm text-red-700">
@@ -721,7 +968,21 @@ export function Builder({ hidePortfolioPanel = false }: BuilderProps) {
                         horizonLabel: horizonLabel(state.horizon),
                       }}
                       onEditSettings={() => setSettingsOpen(true)}
-                      onBackToChat={() => setShowResults(false)}
+                      onBackToChat={() => setChatOpen(true)}
+                      strategyEnabled={Boolean(active.enabled)}
+                      onToggleActivate={activateFromSimulation}
+                      paperStatus={
+                        active.enabled && paperSchedule
+                          ? {
+                              broker: paperSchedule.broker,
+                              nextRunAt: paperSchedule.nextRunAt,
+                              lastError: paperSchedule.lastError,
+                            }
+                          : active.enabled
+                            ? { broker: "paper", nextRunAt: null }
+                            : null
+                      }
+                      activateMessage={activateMsg}
                       importedSnapshot={
                         portfolio
                           ? {
@@ -754,7 +1015,7 @@ export function Builder({ hidePortfolioPanel = false }: BuilderProps) {
                     <button
                       type="button"
                       disabled={loading || apiDown}
-                      onClick={() => void runBacktest()}
+                      onClick={() => startSimulation()}
                       className="mt-4 rounded-xl bg-[var(--text)] px-3 py-2 text-xs font-medium text-white disabled:opacity-50"
                     >
                       {loading ? "Calcul…" : "Lancer la simulation"}
@@ -771,23 +1032,47 @@ export function Builder({ hidePortfolioPanel = false }: BuilderProps) {
               onMessagesChange={setChatMessages}
               portfolioCurrency={portfolio?.portfolio.currency ?? state.currency}
               firstTransactionDate={portfolio?.firstTransactionDate ?? null}
-              onValidateAndActivate={(patch) => {
+              onOpenSettings={() => setSettingsOpen(true)}
+              onValidateAndSimulate={(patch) => {
+                const cleanPatch = scrubYearBudget(
+                  Object.fromEntries(
+                    Object.entries(patch).filter(([, v]) => v !== undefined && v !== null),
+                  ) as Partial<EditorState>,
+                );
+                const chatAllocation =
+                  Array.isArray(cleanPatch.allocation) &&
+                  cleanPatch.allocation.some((a) => a.pct > 0)
+                    ? cleanPatch.allocation.map((a) => ({
+                        asset: a.asset,
+                        pct: a.pct,
+                      }))
+                    : null;
+                const assetsChoice =
+                  cleanPatch.assetsChoice ?? active.state.assetsChoice;
+                const portfolioAlloc = portfolio
+                  ? allocationFromPortfolio(portfolio)
+                  : null;
+                const nextAllocation =
+                  assetsChoice === "portfolio"
+                    ? portfolioAlloc ??
+                      (state.allocation.some((a) => a.pct > 0)
+                        ? state.allocation
+                        : chatAllocation ?? state.allocation)
+                    : chatAllocation ??
+                      (state.allocation.some((a) => a.pct > 0)
+                        ? state.allocation
+                        : portfolioAlloc ?? state.allocation);
+                const customConfirmed =
+                  assetsChoice === "custom" && Boolean(chatAllocation?.length);
+
                 setStrategies((prev) => {
-                  const exclusive = withExclusiveEnabled(prev, activeId);
-                  const next = exclusive.map((s) => {
+                  const next = prev.map((s) => {
                     if (s.id !== activeId) return s;
-                    const cleanPatch = scrubYearBudget(
-                      Object.fromEntries(
-                        Object.entries(patch).filter(([, v]) => v !== undefined && v !== null),
-                      ) as Partial<EditorState>,
-                    );
-                    // Ne pas repartir de blankEditorState/classicOff : ça coupait
-                    // régime, dip, RSI… si le patch chat était partiel.
-                    const { allocation: _ignoredAlloc, ...patchWithoutAlloc } = cleanPatch;
                     const merged: EditorState = {
                       ...s.state,
-                      ...patchWithoutAlloc,
-                      allocation: s.state.allocation,
+                      ...cleanPatch,
+                      allocation: nextAllocation,
+                      assetsChoice,
                       currency:
                         portfolio?.portfolio.currency ??
                         cleanPatch.currency ??
@@ -795,16 +1080,40 @@ export function Builder({ hidePortfolioPanel = false }: BuilderProps) {
                     };
                     return {
                       ...s,
-                      enabled: true,
+                      enabled: false,
+                      assetsConfirmed: customConfirmed
+                        ? true
+                        : assetsChoice === "portfolio"
+                          ? false
+                          : s.assetsConfirmed,
                       state: merged,
                       updatedAt: new Date().toISOString(),
                     };
                   });
-                  saveStrategyStore({ version: 1, activeId, strategies: next });
+                  saveStrategyStore({ version: 3, activeId, strategies: next });
                   return next;
                 });
-                setShowAllocQuiz(true);
-                setShowResults(false);
+                setChatOpen(false);
+
+                // Oui portefeuille → toujours le quiz (pré-rempli) pour confirmer les %.
+                if (assetsChoice === "portfolio") {
+                  setState((s) => ({ ...s, ...cleanPatch, allocation: nextAllocation, assetsChoice }));
+                  setShowResults(false);
+                  setShowAllocQuiz(true);
+                  return;
+                }
+                // Non + tickers (ou allocation chat) → skip quiz.
+                if (customConfirmed || active.assetsConfirmed) {
+                  void runBacktest({ ...cleanPatch, allocation: nextAllocation });
+                  return;
+                }
+                // Legacy / pas de chat actifs → comportement actuel.
+                if (!active.assetsConfirmed) {
+                  setShowResults(false);
+                  setShowAllocQuiz(true);
+                  return;
+                }
+                void runBacktest({ ...cleanPatch, allocation: nextAllocation });
               }}
             />
           )}
@@ -911,7 +1220,8 @@ export function Builder({ hidePortfolioPanel = false }: BuilderProps) {
                 disabled={loading || apiDown}
                 onClick={() => {
                   setSettingsOpen(false);
-                  void runBacktest();
+                  if (active?.assetsConfirmed) void runBacktest();
+                  else startSimulation();
                 }}
                 className="w-full rounded-xl bg-[var(--text)] px-3 py-2.5 text-sm font-medium text-white disabled:opacity-50"
               >
@@ -986,6 +1296,88 @@ export function Builder({ hidePortfolioPanel = false }: BuilderProps) {
               >
                 {positionsBusy ? "…" : "Enregistrer"}
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {needSimulationOpen && (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/40 p-4"
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="need-sim-title"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setNeedSimulationOpen(false);
+          }}
+        >
+          <div className="w-full max-w-md rounded-2xl border border-[var(--border)] bg-[var(--bg-elevated)] p-5 shadow-xl">
+            <p id="need-sim-title" className="text-sm font-semibold text-[var(--text)]">
+              Analyse d’abord la stratégie
+            </p>
+            <p className="mt-3 text-sm leading-relaxed text-[var(--muted)]">
+              Tu ne peux activer une stratégie qu’après l’avoir simulée. Lance la simulation, regarde
+              les résultats, puis clique sur « Activer la stratégie ».
+            </p>
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setNeedSimulationOpen(false)}
+                className="rounded-xl border border-[var(--border)] px-3 py-2 text-xs text-[var(--muted)] hover:text-[var(--text)]"
+              >
+                Fermer
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setNeedSimulationOpen(false);
+                  setChatOpen(false);
+                  startSimulation();
+                }}
+                className="rounded-xl bg-[var(--text)] px-3 py-2 text-xs font-medium text-white hover:bg-[#2a2a2a]"
+              >
+                Lancer la simulation
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+      {brokerRequiredOpen && (
+        <div
+          className="fixed inset-0 z-[70] flex items-center justify-center bg-black/40 p-4"
+          role="alertdialog"
+          aria-modal="true"
+          aria-labelledby="broker-required-title"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setBrokerRequiredOpen(false);
+          }}
+        >
+          <div className="w-full max-w-md rounded-2xl border border-[var(--border)] bg-[var(--bg-elevated)] p-5 shadow-xl">
+            <p id="broker-required-title" className="text-sm font-semibold text-[var(--text)]">
+              Binance Testnet requis
+            </p>
+            <p className="mt-3 text-sm leading-relaxed text-[var(--muted)]">
+              Pour activer une stratégie, Ordium a besoin d’une connexion d’exécution{" "}
+              <span className="font-medium text-[var(--text)]">paper</span> (Binance Testnet) :
+              les ordres se passeront tout seuls selon tes règles, avec de l’argent fictif.
+            </p>
+            <p className="mt-3 text-sm leading-relaxed text-[var(--muted)]">
+              Connecte tes clés API Testnet sur la page Exécution, puis reviens ici pour activer.
+            </p>
+            <div className="mt-5 flex flex-wrap justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => setBrokerRequiredOpen(false)}
+                className="rounded-xl border border-[var(--border)] px-3 py-2 text-xs text-[var(--muted)] hover:text-[var(--text)]"
+              >
+                Plus tard
+              </button>
+              <Link
+                href="/execution"
+                onClick={() => setBrokerRequiredOpen(false)}
+                className="rounded-xl bg-[var(--text)] px-3 py-2 text-xs font-medium text-white hover:bg-[#2a2a2a]"
+              >
+                Connecter Binance Testnet
+              </Link>
             </div>
           </div>
         </div>

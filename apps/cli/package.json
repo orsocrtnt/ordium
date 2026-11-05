@@ -1,0 +1,21 @@
+{
+  "name": "@ordium/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "ordium": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "echo \"(pas de tests CLI en v0)\""
+  },
+  "dependencies": {
+    "@ordium/data": "workspace:*",
+    "@ordium/engine": "workspace:*",
+    "commander": "^13.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}

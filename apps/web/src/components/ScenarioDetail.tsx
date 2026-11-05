@@ -16,18 +16,20 @@ import type { BacktestResult, Purchase } from "@ordium/engine";
 import type { RealPortfolioSeries, Transaction } from "@ordium/portfolio";
 import type { PositionValuation } from "@ordium/portfolio";
 import { assetLabel } from "@/lib/assets";
-import { MarketChart, type ChartPayload } from "@/components/MarketChart";
-import { apiFetch } from "@/lib/api";
 import { fmtMoney, fmtMonth, fmtNum, fmtPct } from "@/lib/format";
+import {
+  MarketChart,
+  type ChartPayload,
+  type MarketChartOverlays,
+} from "@/components/MarketChart";
+import { apiFetch } from "@/lib/api";
+import {
+  hasChartSignals,
+  overlaysForSignals,
+  signalsFromRules,
+} from "@/lib/chartSignals";
 
 export type ScenarioId = "actuel" | "dca" | "strat";
-
-type MarketChartResponse = ChartPayload & {
-  symbol: string;
-  quote: string;
-  assetType: string;
-  asOf: string;
-};
 
 type AssetRow = {
   asset: string;
@@ -59,14 +61,120 @@ function slimPoints<T>(rows: T[], max = 400): T[] {
   return rows.filter((_, i) => i % step === 0 || i === rows.length - 1);
 }
 
+type FearGreedLive = { value: number; classification: string; timestamp: string };
+
+function fearGreedFillGradient(value: number): string {
+  if (value <= 25) return "linear-gradient(90deg, #dc2626, #f97316)";
+  if (value <= 45) return "linear-gradient(90deg, #f97316, #eab308)";
+  if (value <= 55) return "linear-gradient(90deg, #eab308, #84cc16)";
+  if (value <= 75) return "linear-gradient(90deg, #84cc16, #22c55e)";
+  return "linear-gradient(90deg, #22c55e, #16a34a)";
+}
+
+function FearGreedCard({
+  data,
+  levels,
+}: {
+  data: FearGreedLive;
+  levels: number[];
+}) {
+  return (
+    <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] p-3">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <p className="text-[11px] font-medium uppercase tracking-[0.16em] text-[var(--accent)]">
+            Fear &amp; Greed — live
+          </p>
+          <p className="mt-1 text-xs text-[var(--muted)]">
+            Indice crypto global (Alternative.me)
+            {levels.length > 0 ? ` · seuils stratégie : ${levels.join(" / ")}` : ""}
+          </p>
+        </div>
+        <div className="text-right">
+          <p className="text-3xl font-semibold tabular-nums text-[var(--text)]">{data.value}</p>
+          <p className="text-xs text-[var(--muted)]">{data.classification}</p>
+        </div>
+      </div>
+      <div className="mt-3">
+        <div className="h-3 overflow-hidden rounded-full bg-[#f4f4f1]">
+          <div
+            className="h-full rounded-full"
+            style={{
+              width: `${Math.max(0, Math.min(100, data.value))}%`,
+              background: fearGreedFillGradient(data.value),
+            }}
+          />
+        </div>
+        <div className="mt-1 flex justify-between text-[10px] text-[var(--muted)]">
+          <span>Peur</span>
+          <span>Neutre</span>
+          <span>Cupidité</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function LiveIndicatorStrip({
+  chart,
+  show,
+}: {
+  chart: ChartPayload;
+  show: { rsi: boolean; macd: boolean; sma: boolean; bollinger: boolean };
+}) {
+  const last = chart.candles.length - 1;
+  if (last < 0) return null;
+  const rsi = chart.indicators.rsi14[last];
+  const macd = chart.indicators.macd[last];
+  const sma50 = chart.indicators.sma50[last];
+  const bb = chart.indicators.bollinger[last];
+  const price = chart.candles[last]?.close;
+
+  const items: { label: string; value: string }[] = [];
+  if (show.rsi && rsi != null) items.push({ label: "RSI(14)", value: rsi.toFixed(1) });
+  if (show.macd && macd) {
+    items.push({ label: "MACD hist", value: macd.histogram.toFixed(3) });
+  }
+  if (show.sma && sma50 != null && price != null) {
+    const vs = ((price - sma50) / sma50) * 100;
+    items.push({ label: "vs SMA50", value: `${vs >= 0 ? "+" : ""}${vs.toFixed(1)} %` });
+  }
+  if (show.bollinger && bb && price != null) {
+    const span = bb.upper - bb.lower;
+    const pctB = span > 0 ? (price - bb.lower) / span : null;
+    if (pctB != null) items.push({ label: "%B", value: pctB.toFixed(2) });
+  }
+  if (items.length === 0) return null;
+
+  return (
+    <div className="flex flex-wrap gap-2">
+      {items.map((it) => (
+        <div
+          key={it.label}
+          className="rounded-lg border border-[var(--border)] bg-[var(--bg-elevated)] px-2.5 py-1.5"
+        >
+          <div className="text-[10px] uppercase tracking-wide text-[var(--muted)]">{it.label}</div>
+          <div className="text-sm font-semibold tabular-nums text-[var(--text)]">{it.value}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function purchaseTimeSec(date: string): number {
+  return Math.floor(new Date(`${date}T00:00:00Z`).getTime() / 1000);
+}
+
 function Kpi({
   label,
   value,
   tone,
+  hint,
 }: {
   label: string;
   value: ReactNode;
   tone?: "pos" | "neg" | "muted";
+  hint?: string;
 }) {
   const color =
     tone === "pos"
@@ -77,9 +185,13 @@ function Kpi({
           ? "text-[var(--muted)]"
           : "text-[var(--text)]";
   return (
-    <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] px-3 py-2">
+    <div
+      className="rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] px-3 py-2"
+      title={hint}
+    >
       <div className="text-[10px] uppercase tracking-wide text-[var(--muted)]">{label}</div>
       <div className={`mt-0.5 text-sm font-semibold tabular-nums ${color}`}>{value}</div>
+      {hint && <div className="mt-0.5 text-[9px] leading-snug text-[var(--muted)]">{hint}</div>}
     </div>
   );
 }
@@ -153,7 +265,7 @@ function PortfolioChart({
           <Area
             type="monotone"
             dataKey="contributed"
-            name="Total versé"
+            name="Total versé (stratégie)"
             stroke="var(--muted)"
             strokeWidth={1.5}
             strokeDasharray="4 4"
@@ -470,6 +582,29 @@ export function ScenarioDetail({
   const accent = ACCENT[scenario];
   const bt = scenario === "dca" ? baseline : scenario === "strat" ? result : null;
 
+  const chartSignals = useMemo(() => {
+    if (scenario === "actuel") {
+      return {
+        sma: true,
+        bollinger: true,
+        rsi: true,
+        macd: true,
+        fearGreed: false,
+        dip: false,
+        ath: false,
+        drawdown: false,
+        rsiLevels: [] as number[],
+        fearGreedLevels: [] as number[],
+        labels: ["SMA", "Bollinger", "RSI", "MACD"],
+      };
+    }
+    if (scenario === "strat") return signalsFromRules(result.rules);
+    return signalsFromRules(baseline.rules);
+  }, [scenario, result.rules, baseline.rules]);
+
+  const showStrategyChart =
+    scenario === "actuel" || (scenario === "strat" && hasChartSignals(chartSignals));
+
   const points: SeriesPoint[] = useMemo(() => {
     if (scenario === "actuel") return real?.points ?? [];
     return bt?.valueSeries ?? [];
@@ -519,17 +654,81 @@ export function ScenarioDetail({
   );
 
   const [selectedAsset, setSelectedAsset] = useState<string | null>(null);
-  const [selectedMarketChart, setSelectedMarketChart] = useState<MarketChartResponse | null>(null);
-  const [selectedMarketBusy, setSelectedMarketBusy] = useState(false);
-  const [selectedMarketError, setSelectedMarketError] = useState<string | null>(null);
   useEffect(() => {
     setSelectedAsset(null);
-    setSelectedMarketChart(null);
-    setSelectedMarketError(null);
   }, [scenario]);
 
   const activeAsset =
     selectedAsset && sortedAssets.some((a) => a.asset === selectedAsset) ? selectedAsset : null;
+
+  const [marketChart, setMarketChart] = useState<ChartPayload | null>(null);
+  const [marketChartBusy, setMarketChartBusy] = useState(false);
+  const [marketChartError, setMarketChartError] = useState<string | null>(null);
+  const [fearGreed, setFearGreed] = useState<FearGreedLive | null>(null);
+
+  useEffect(() => {
+    if (!showStrategyChart || !activeAsset) {
+      setMarketChart(null);
+      setMarketChartBusy(false);
+      setMarketChartError(null);
+      return;
+    }
+
+    let cancelled = false;
+    setMarketChartBusy(true);
+    setMarketChartError(null);
+    setMarketChart(null);
+
+    (async () => {
+      try {
+        const res = await apiFetch("/api/markets/chart", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ symbol: activeAsset, timeframe: "1d" }),
+        });
+        const json = (await res.json()) as unknown;
+        if (!res.ok) {
+          const errMsg =
+            typeof json === "object" && json != null && "error" in json
+              ? String((json as { error?: unknown }).error ?? "Chargement chart impossible")
+              : "Chargement chart impossible";
+          throw new Error(errMsg);
+        }
+        if (!cancelled) setMarketChart(json as ChartPayload);
+      } catch (e) {
+        if (!cancelled) setMarketChartError((e as Error).message);
+      } finally {
+        if (!cancelled) setMarketChartBusy(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [showStrategyChart, activeAsset]);
+
+  useEffect(() => {
+    if (!activeAsset || !chartSignals.fearGreed) {
+      setFearGreed(null);
+      return;
+    }
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const res = await apiFetch("/api/markets/fear-greed");
+        const json = await res.json();
+        if (res.ok && !cancelled) setFearGreed(json as FearGreedLive);
+      } catch {
+        // ignore
+      }
+    };
+    void load();
+    const id = window.setInterval(() => void load(), 60_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [activeAsset, chartSignals.fearGreed]);
 
   const purchases = bt?.purchases;
   const endDate =
@@ -563,39 +762,29 @@ export function ScenarioDetail({
   const activeAssetHistory = activeAsset
     ? assetHistories.find(({ row }) => row.asset === activeAsset) ?? null
     : null;
-  useEffect(() => {
-    if (!activeAsset) {
-      setSelectedMarketChart(null);
-      setSelectedMarketError(null);
-      setSelectedMarketBusy(false);
-      return;
+
+  const marketOverlays: MarketChartOverlays | undefined = useMemo(() => {
+    if (scenario === "actuel") {
+      return {
+        sma: true,
+        bollinger: true,
+        rsi: true,
+        macd: true,
+        buyMarkers: [],
+      };
     }
-    let cancelled = false;
-    setSelectedMarketBusy(true);
-    setSelectedMarketError(null);
-    void (async () => {
-      try {
-        const res = await apiFetch("/api/markets/chart", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ symbol: activeAsset, timeframe: "1d" }),
-        });
-        const json = await res.json();
-        if (cancelled) return;
-        if (!res.ok) throw new Error(json.error ?? "Chargement du graphique impossible");
-        setSelectedMarketChart(json as MarketChartResponse);
-      } catch (e) {
-        if (cancelled) return;
-        setSelectedMarketChart(null);
-        setSelectedMarketError((e as Error).message);
-      } finally {
-        if (!cancelled) setSelectedMarketBusy(false);
-      }
-    })();
-    return () => {
-      cancelled = true;
+    const o = overlaysForSignals(chartSignals);
+    const buyMarkers =
+      activeAssetHistory?.buyMarks.map((b) => ({
+        time: purchaseTimeSec(b.date),
+        text: "Achat",
+      })) ?? [];
+    return {
+      ...o,
+      rsiLevels: chartSignals.rsiLevels,
+      buyMarkers,
     };
-  }, [activeAsset]);
+  }, [scenario, chartSignals, activeAssetHistory]);
 
   const invested =
     scenario === "actuel"
@@ -633,7 +822,7 @@ export function ScenarioDetail({
             </h3>
           </div>
           <p className="mt-1 text-[11px] text-[var(--muted)]">
-            Clique une ligne du tableau pour afficher directement le graphique de cet actif.
+            Clique une ligne : graphiques et indicateurs de ta stratégie pour cet actif.
           </p>
         </div>
       </div>
@@ -664,65 +853,131 @@ export function ScenarioDetail({
 
       {bt && (
         <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-          <Kpi label="Cash restant" value={fmtMoney(bt.cash, currency, 2)} tone="muted" />
+          <Kpi
+            label="Cash restant"
+            value={fmtMoney(bt.cash, currency, 2)}
+            tone="muted"
+            hint={
+              bt.invested < 0.01 && bt.contributed > 0
+                ? "Tout le versé est resté en cash (aucun signal d’achat sur la période)."
+                : "Versé − investi (mois sans achat, veto, réserve…)"
+            }
+          />
           <Kpi label="Investi (achats)" value={fmtMoney(bt.invested, currency, 2)} />
           <Kpi label="Frais" value={fmtMoney(bt.fees, currency, 2)} tone="muted" />
           <Kpi label="Achats" value={String(bt.purchases.length)} tone="muted" />
         </div>
       )}
 
-      <div id="scenario-main-chart">
-        <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">
-          {activeAssetHistory
-            ? `Graphique — ${assetLabel(activeAssetHistory.row.asset, assetNames)}`
-            : "Évolution du portefeuille"}
-        </h4>
-        {activeAssetHistory ? (
-          <div className="space-y-2">
-            {selectedMarketBusy ? (
-              <div className="rounded-xl border border-[var(--border)] bg-white px-4 py-8 text-sm text-[var(--muted)]">
-                Chargement du graphique…
-              </div>
-            ) : selectedMarketChart ? (
-              <MarketChart
-                data={{
-                  timeframe: selectedMarketChart.timeframe,
-                  candles: selectedMarketChart.candles,
-                  indicators: selectedMarketChart.indicators,
-                }}
-              />
-            ) : selectedMarketError ? (
-              <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-900">
-                {selectedMarketError}
-              </div>
-            ) : (
-              <AssetPerfChart
-                data={activeAssetHistory.history}
-                currency={currency}
-                purchases={activeAssetHistory.buyMarks}
-                accent={accent}
-                title={assetLabel(activeAssetHistory.row.asset, assetNames)}
-                assetId={activeAssetHistory.row.asset}
-              />
-            )}
+      {bt && bt.warnings.length > 0 && (
+        <div className="space-y-1 rounded-xl border border-amber-200 bg-amber-50/80 px-3 py-2">
+          {bt.warnings.slice(0, 5).map((w) => (
+            <p key={w} className="text-[11px] leading-snug text-amber-950">
+              {w.replace(/^\[(warning|info|error)\]\s*/i, "")}
+            </p>
+          ))}
+        </div>
+      )}
+
+      {activeAssetHistory && (
+        <div id="selected-asset-chart" className="space-y-3">
+          <div className="flex items-center justify-between gap-2">
+            <h4 className="text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">
+              {assetLabel(activeAssetHistory.row.asset, assetNames)}
+              {scenario === "strat" && chartSignals.labels.length > 0
+                ? " · indicateurs stratégie"
+                : scenario === "actuel"
+                  ? " · marché"
+                  : " · investissement"}
+            </h4>
             <button
               type="button"
               onClick={() => setSelectedAsset(null)}
               className="rounded-lg border border-[var(--border)] px-2.5 py-1 text-xs text-[var(--muted)] hover:text-[var(--text)]"
             >
-              Revenir au portefeuille
+              Fermer
             </button>
           </div>
-        ) : (
-          <PortfolioChart points={points} currency={currency} accent={accent} />
-        )}
-        {!activeAssetHistory && scenario === "actuel" && !real?.points?.length && (
-          <p className="mt-2 text-[11px] text-[var(--muted)]">
-            Importe des transactions pour une courbe jour par jour (positions seules =
-            snapshot).
+
+          {scenario === "strat" && chartSignals.labels.length > 0 && (
+            <div className="flex flex-wrap gap-1.5">
+              {chartSignals.labels.map((label) => (
+                <span
+                  key={label}
+                  className="rounded-md border border-[var(--border)] bg-[var(--bg-elevated)] px-2 py-0.5 text-[11px] text-[var(--text)]"
+                >
+                  {label}
+                </span>
+              ))}
+            </div>
+          )}
+
+          {showStrategyChart && (
+            <div className="space-y-2">
+              {chartSignals.fearGreed && fearGreed && (
+                <FearGreedCard data={fearGreed} levels={chartSignals.fearGreedLevels} />
+              )}
+              {chartSignals.fearGreed && !fearGreed && activeAsset && (
+                <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] p-3 text-xs text-[var(--muted)]">
+                  Chargement Fear &amp; Greed…
+                </div>
+              )}
+              {marketChartBusy && (
+                <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] p-4 text-xs text-[var(--muted)]">
+                  Chargement du graphique de marché…
+                </div>
+              )}
+              {marketChartError && (
+                <div className="rounded-xl border border-[var(--border)] bg-[var(--bg-elevated)] p-4 text-xs text-[var(--muted)]">
+                  {marketChartError}
+                </div>
+              )}
+              {!marketChartBusy && !marketChartError && marketChart && (
+                <>
+                  <LiveIndicatorStrip
+                    chart={marketChart}
+                    show={
+                      scenario === "actuel"
+                        ? { rsi: true, macd: true, sma: true, bollinger: true }
+                        : overlaysForSignals(chartSignals)
+                    }
+                  />
+                  <MarketChart data={marketChart} overlays={marketOverlays} />
+                  <p className="text-[11px] text-[var(--muted)]">
+                    {scenario === "actuel"
+                      ? "Prix · SMA · Bollinger · RSI · MACD — moteur @ordium/engine"
+                      : "Panneaux filtrés selon ta stratégie · flèches = achats du backtest"}
+                  </p>
+                </>
+              )}
+              {!marketChartBusy && !marketChartError && !marketChart && (
+                <div className="rounded-xl border border-dashed border-[var(--border)] bg-[var(--bg-elevated)] p-4 text-center text-xs text-[var(--muted)]">
+                  Aucun graphique de marché disponible pour cet actif.
+                </div>
+              )}
+            </div>
+          )}
+
+          {scenario !== "actuel" && (
+            <AssetPerfChart
+              data={activeAssetHistory.history}
+              currency={currency}
+              purchases={activeAssetHistory.buyMarks}
+              accent={accent}
+              title={assetLabel(activeAssetHistory.row.asset, assetNames)}
+              assetId={activeAssetHistory.row.asset}
+            />
+          )}
+        </div>
+      )}
+      {!activeAssetHistory && (
+        <div className="rounded-xl border border-dashed border-[var(--border)] bg-[var(--bg-elevated)] px-4 py-6 text-center">
+          <p className="text-sm font-medium text-[var(--text)]">Sélectionne une ligne</p>
+          <p className="mt-1 text-xs text-[var(--muted)]">
+            Le graphique apparaît uniquement quand tu cliques sur un actif.
           </p>
-        )}
-      </div>
+        </div>
+      )}
 
       <div>
         <h4 className="mb-2 text-xs font-semibold uppercase tracking-wide text-[var(--muted)]">
@@ -758,7 +1013,7 @@ export function ScenarioDetail({
                         }
                         setSelectedAsset(a.asset);
                         document
-                          .getElementById("scenario-main-chart")
+                          .getElementById("selected-asset-chart")
                           ?.scrollIntoView({ behavior: "smooth", block: "start" });
                       }}
                     >
